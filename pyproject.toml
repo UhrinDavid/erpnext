@@ -1,9 +1,9 @@
 [project]
-name = "xml_item_importer"
+name = "xml_importer"
 authors = [
     { name = "Herbatica", email = "admin@gmail.com"}
 ]
-description = "Use xlm feed to import items"
+description = "Import data from XML feeds into ERPNext"
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]

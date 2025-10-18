@@ -1,0 +1,121 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:XML-ORDER-{#####}",
+ "creation": "2025-10-15 00:00:00",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "import_date",
+  "import_type",
+  "xml_source",
+  "status",
+  "column_break_4",
+  "orders_imported",
+  "orders_updated",
+  "errors",
+  "section_break_8",
+  "error_details",
+  "section_break_10",
+  "summary"
+ ],
+ "fields": [
+  {
+   "fieldname": "import_date",
+   "fieldtype": "Datetime",
+   "label": "Import Date",
+   "reqd": 1
+  },
+  {
+   "fieldname": "import_type",
+   "fieldtype": "Select",
+   "label": "Import Type",
+   "options": "Items\nOrders\nCustomers\nProduct Updates",
+   "reqd": 1,
+   "default": "Orders"
+  },
+  {
+   "fieldname": "xml_source",
+   "fieldtype": "Data",
+   "label": "XML Source",
+   "reqd": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Success\nFailed\nPartial",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_4",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "orders_imported",
+   "fieldtype": "Int",
+   "label": "Records Imported"
+  },
+  {
+   "default": "0",
+   "fieldname": "orders_updated",
+   "fieldtype": "Int",
+   "label": "Records Updated"
+  },
+  {
+   "default": "0",
+   "fieldname": "errors",
+   "fieldtype": "Int",
+   "label": "Errors"
+  },
+  {
+   "fieldname": "section_break_8",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "error_details",
+   "fieldtype": "Long Text",
+   "label": "Error Details"
+  },
+  {
+   "fieldname": "section_break_10",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "summary",
+   "fieldtype": "JSON",
+   "label": "Import Summary"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2025-10-15 00:00:00",
+ "modified_by": "Administrator",
+ "module": "Xml Importer",
+ "name": "XML Order Import Log",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Sales Manager"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "xml_source",
+ "track_changes": 1
+}

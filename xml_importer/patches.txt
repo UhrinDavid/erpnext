@@ -1,0 +1,9 @@
+[pre_model_sync]
+# Patches added in this section will be executed before doctypes are migrated
+# Read docs to understand patches: https://frappeframework.com/docs/v14/user/en/database-migrations
+
+[post_model_sync]
+# Patches added in this section will be executed after doctypes are migrated
+xml_importer.xml_importer.patches.v1_0.migrate_xml_import_log_fields
+xml_importer.xml_importer.patches.v1_0.migrate_to_unified_configuration
+xml_importer.xml_importer.patches.v1_0.migrate_order_import_logs

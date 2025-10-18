@@ -1,0 +1,136 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-10-15 00:00:00",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "enabled",
+  "xml_feed_url",
+  "company",
+  "section_break_4",
+  "import_frequency",
+  "column_break_7",
+  "last_import",
+  "last_import_status",
+  "section_break_12",
+  "notification_emails",
+  "section_break_14",
+  "create_customers",
+  "create_placeholder_items",
+  "auto_submit_orders"
+ ],
+ "fields": [
+  {
+   "default": "0",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enable XML Order Import"
+  },
+  {
+   "fieldname": "xml_feed_url",
+   "fieldtype": "Small Text",
+   "label": "XML Feed URL",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "fieldname": "section_break_4",
+   "fieldtype": "Section Break"
+  },
+  {
+   "default": "Hourly",
+   "fieldname": "import_frequency",
+   "fieldtype": "Select",
+   "label": "Import Frequency",
+   "options": "Hourly\nDaily\nWeekly"
+  },
+  {
+   "fieldname": "column_break_7",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "last_import",
+   "fieldtype": "Datetime",
+   "label": "Last Import",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_import_status",
+   "fieldtype": "Select",
+   "label": "Last Import Status",
+   "options": "Success\nFailed\nPartial",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_12",
+   "fieldtype": "Section Break",
+   "label": "Notifications"
+  },
+  {
+   "fieldname": "notification_emails",
+   "fieldtype": "Small Text",
+   "label": "Notification Emails",
+   "description": "Comma-separated email addresses to notify about import results"
+  },
+  {
+   "fieldname": "section_break_14",
+   "fieldtype": "Section Break",
+   "label": "Import Options"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_customers",
+   "fieldtype": "Check",
+   "label": "Auto-create Customers"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_placeholder_items",
+   "fieldtype": "Check",
+   "label": "Create Placeholder Items"
+  },
+  {
+   "default": "0",
+   "fieldname": "auto_submit_orders",
+   "fieldtype": "Check",
+   "label": "Auto-submit Sales Orders"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2025-10-15 00:00:00",
+ "modified_by": "Administrator",
+ "module": "Xml Importer",
+ "name": "XML Order Import Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Sales Manager",
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

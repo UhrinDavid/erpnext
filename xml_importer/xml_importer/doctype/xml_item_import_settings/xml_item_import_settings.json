@@ -1,0 +1,178 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2024-12-19 14:30:00.000000",
+ "default_view": "List",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "enabled",
+  "xml_feed_url",
+  "company",
+  "section_break_4",
+  "import_frequency",
+  "check_feed_changes",
+  "column_break_7",
+  "last_import",
+  "last_import_status",
+  "last_etag",
+  "last_modified",
+  "last_content_size",
+  "section_break_12",
+  "notification_emails",
+  "section_break_14",
+  "custom_fields_section",
+  "create_item_groups",
+  "create_manufacturers",
+  "update_stock_levels",
+  "download_images"
+ ],
+ "fields": [
+  {
+   "default": "0",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enable XML Item Import"
+  },
+  {
+   "fieldname": "xml_feed_url",
+   "fieldtype": "Small Text",
+   "label": "XML Feed URL",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "fieldname": "section_break_4",
+   "fieldtype": "Section Break",
+   "label": "Import Configuration"
+  },
+  {
+   "default": "Daily",
+   "fieldname": "import_frequency",
+   "fieldtype": "Select",
+   "label": "Import Frequency",
+   "options": "Hourly\nDaily\nWeekly"
+  },
+  {
+   "default": "1",
+   "fieldname": "check_feed_changes",
+   "fieldtype": "Check",
+   "label": "Check Feed Changes"
+  },
+  {
+   "fieldname": "column_break_7",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "last_import",
+   "fieldtype": "Datetime",
+   "label": "Last Import",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_import_status",
+   "fieldtype": "Select",
+   "label": "Last Import Status",
+   "options": "Success\nFailed\nPartial",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_etag",
+   "fieldtype": "Data",
+   "label": "Last ETag",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_modified",
+   "fieldtype": "Data",
+   "label": "Last Modified",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_content_size",
+   "fieldtype": "Int",
+   "label": "Last Content Size",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_12",
+   "fieldtype": "Section Break",
+   "label": "Notifications"
+  },
+  {
+   "fieldname": "notification_emails",
+   "fieldtype": "Small Text",
+   "label": "Notification Emails (comma separated)"
+  },
+  {
+   "fieldname": "section_break_14",
+   "fieldtype": "Section Break",
+   "label": "Import Options"
+  },
+  {
+   "fieldname": "custom_fields_section",
+   "fieldtype": "Section Break",
+   "label": "Automatic Creation Options"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_item_groups",
+   "fieldtype": "Check",
+   "label": "Create Item Groups"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_manufacturers",
+   "fieldtype": "Check",
+   "label": "Create Manufacturers"
+  },
+  {
+   "default": "1",
+   "fieldname": "update_stock_levels",
+   "fieldtype": "Check",
+   "label": "Update Stock Levels"
+  },
+  {
+   "default": "1",
+   "fieldname": "download_images",
+   "fieldtype": "Check",
+   "label": "Download Images"
+  }
+ ],
+ "has_web_view": 0,
+ "hide_toolbar": 0,
+ "idx": 0,
+ "index_web_pages_for_search": 1,
+ "is_single": 1,
+ "links": [],
+ "modified": "2024-12-19 14:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "Xml Importer",
+ "name": "XML Item Import Settings",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

@@ -1,0 +1,205 @@
+{% extends "templates/web.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block page_content %}
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-12">
+            <h2>{{ title }}</h2>
+
+            {% if configurations %}
+            <div class="card mb-4">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5>Import Configurations</h5>
+                    <a href="/app/xml-import-configuration" class="btn btn-sm btn-primary">Add New Configuration</a>
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="table table-striped">
+                            <thead>
+                                <tr>
+                                    <th>Import Type</th>
+                                    <th>Status</th>
+                                    <th>XML Feed URL</th>
+                                    <th>Last Import</th>
+                                    <th>Last Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for config in configurations %}
+                                <tr>
+                                    <td>
+                                        <span class="badge badge-info">{{ config.import_type }}</span>
+                                    </td>
+                                    <td>
+                                        <span class="badge badge-{{ 'success' if config.enabled else 'secondary' }}">
+                                            {{ 'Enabled' if config.enabled else 'Disabled' }}
+                                        </span>
+                                    </td>
+                                    <td>
+                                        <span title="{{ config.xml_feed_url }}">
+                                            {{ config.xml_feed_url[:50] + '...' if config.xml_feed_url and config.xml_feed_url|length > 50 else config.xml_feed_url or 'Not set' }}
+                                        </span>
+                                    </td>
+                                    <td>{{ config.last_import or 'Never' }}</td>
+                                    <td>
+                                        {% if config.last_import_status %}
+                                        <span class="badge badge-{{ 'success' if config.last_import_status == 'Success' else 'danger' if config.last_import_status == 'Failed' else 'warning' }}">
+                                            {{ config.last_import_status }}
+                                        </span>
+                                        {% else %}
+                                        N/A
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if config.enabled %}
+                                        <button class="btn btn-sm btn-primary" onclick="triggerManualImport('{{ config.name }}')">
+                                            Import
+                                        </button>
+                                        {% endif %}
+                                        <a href="/app/xml-import-configuration/{{ config.name }}" class="btn btn-sm btn-outline-secondary">
+                                            Edit
+                                        </a>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            {% else %}
+            <div class="alert alert-warning">
+                <h5>No XML Import Configurations found</h5>
+                <p>Please create an XML Import Configuration to get started.</p>
+                <a href="/app/xml-import-configuration" class="btn btn-primary">Create Configuration</a>
+            </div>
+            {% endif %}
+
+            <div class="card">
+                <div class="card-header">
+                    <h5>Recent Import Logs</h5>
+                </div>
+                <div class="card-body">
+                    {% if recent_logs %}
+                    <div class="table-responsive">
+                        <table class="table table-striped">
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Type</th>
+                                    <th>Status</th>
+                                    <th>Imported</th>
+                                    <th>Updated</th>
+                                    <th>Errors</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for log in recent_logs %}
+                                <tr>
+                                    <td>{{ frappe.format(log.import_datetime, 'Datetime') }}</td>
+                                    <td>
+                                        <span class="badge badge-info">{{ log.import_type }}</span>
+                                    </td>
+                                    <td>
+                                        <span class="badge badge-{{ 'success' if log.status == 'Success' else 'danger' if log.status == 'Failed' else 'warning' }}">
+                                            {{ log.status }}
+                                        </span>
+                                    </td>
+                                    <td>{{ log.records_imported }}</td>
+                                    <td>{{ log.records_updated }}</td>
+                                    <td>{{ log.error_count }}</td>
+                                    <td>
+                                        <a href="/app/xml-import-log/{{ log.name }}" class="btn btn-sm btn-outline-primary">
+                                            View Details
+                                        </a>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <p class="text-muted">No import logs found.</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function triggerManualImport(configName) {
+    if (!confirm('Are you sure you want to trigger a manual import? This may take some time.')) {
+        return;
+    }
+
+    const btn = event.target;
+    btn.disabled = true;
+    btn.innerHTML = 'Importing...';
+
+    frappe.call({
+        method: 'xml_importer.xml_importer.doctype.xml_import_configuration.xml_import_configuration.trigger_manual_import',
+        args: {
+            doc: configName
+        },
+        callback: function(r) {
+            btn.disabled = false;
+            btn.innerHTML = 'Manual Import';
+
+            if (r.message && r.message.success) {
+                frappe.msgprint({
+                    title: 'Import Successful',
+                    message: `Records imported: ${r.message.result.imported || 0}<br>Records updated: ${r.message.result.updated || 0}<br>Errors: ${r.message.result.errors || 0}`,
+                    indicator: 'green'
+                });
+                setTimeout(() => location.reload(), 2000);
+            } else {
+                frappe.msgprint({
+                    title: 'Import Failed',
+                    message: r.message.message || 'Unknown error occurred',
+                    indicator: 'red'
+                });
+            }
+        },
+        error: function(err) {
+            btn.disabled = false;
+            btn.innerHTML = 'Manual Import';
+            frappe.msgprint({
+                title: 'Error',
+                message: 'Failed to trigger import',
+                indicator: 'red'
+            });
+        }
+    });
+}
+
+function testConnection(configName) {
+    frappe.call({
+        method: 'xml_importer.xml_importer.doctype.xml_import_configuration.xml_import_configuration.test_xml_connection',
+        args: {
+            doc: configName
+        },
+        callback: function(r) {
+            if (r.message) {
+                frappe.msgprint({
+                    title: 'Connection Test',
+                    message: r.message,
+                    indicator: 'green'
+                });
+            }
+        },
+        error: function(err) {
+            frappe.msgprint({
+                title: 'Connection Failed',
+                message: err.message || 'Connection test failed',
+                indicator: 'red'
+            });
+        }
+    });
+}
+</script>
+{% endblock %}

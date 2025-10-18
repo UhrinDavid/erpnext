@@ -1,0 +1,227 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-10-15 00:00:00",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "enabled",
+  "import_type",
+  "xml_feed_url",
+  "company",
+
+  "section_break_4",
+  "import_frequency",
+  "check_feed_changes",
+  "column_break_7",
+  "last_import",
+  "last_import_status",
+  "last_etag",
+  "last_modified",
+  "last_content_size",
+  "section_break_12",
+  "notification_emails",
+  "section_break_14",
+  "import_options_section",
+  "create_item_groups",
+  "create_manufacturers",
+  "update_stock_levels",
+  "download_images",
+  "column_break_20",
+  "create_customers",
+  "create_placeholder_items",
+  "auto_submit_orders"
+ ],
+ "fields": [
+  {
+   "default": "0",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enable XML Import"
+  },
+  {
+   "fieldname": "import_type",
+   "fieldtype": "Select",
+   "label": "Import Type",
+   "options": "Items\nOrders\nCustomers\nProduct Updates",
+   "reqd": 1,
+   "default": "Items"
+  },
+  {
+   "fieldname": "xml_feed_url",
+   "fieldtype": "Small Text",
+   "label": "XML Feed URL",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+
+  {
+   "fieldname": "section_break_4",
+   "fieldtype": "Section Break",
+   "label": "Import Configuration"
+  },
+  {
+   "default": "Daily",
+   "fieldname": "import_frequency",
+   "fieldtype": "Select",
+   "label": "Import Frequency",
+   "options": "Hourly\nDaily\nWeekly"
+  },
+  {
+   "default": "1",
+   "fieldname": "check_feed_changes",
+   "fieldtype": "Check",
+   "label": "Check Feed Changes",
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "fieldname": "column_break_7",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "last_import",
+   "fieldtype": "Datetime",
+   "label": "Last Import",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_import_status",
+   "fieldtype": "Select",
+   "label": "Last Import Status",
+   "options": "Success\nFailed\nPartial",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_etag",
+   "fieldtype": "Data",
+   "label": "Last ETag",
+   "read_only": 1,
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "fieldname": "last_modified",
+   "fieldtype": "Data",
+   "label": "Last Modified",
+   "read_only": 1,
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "fieldname": "last_content_size",
+   "fieldtype": "Int",
+   "label": "Last Content Size",
+   "read_only": 1,
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "fieldname": "section_break_12",
+   "fieldtype": "Section Break",
+   "label": "Notifications"
+  },
+  {
+   "fieldname": "notification_emails",
+   "fieldtype": "Small Text",
+   "label": "Notification Emails",
+   "description": "Comma-separated email addresses to notify about import results"
+  },
+  {
+   "fieldname": "section_break_14",
+   "fieldtype": "Section Break",
+   "label": "Import Options"
+  },
+  {
+   "fieldname": "import_options_section",
+   "fieldtype": "Section Break",
+   "label": "Item Import Options",
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_item_groups",
+   "fieldtype": "Check",
+   "label": "Auto-create Item Groups",
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_manufacturers",
+   "fieldtype": "Check",
+   "label": "Auto-create Manufacturers",
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "default": "1",
+   "fieldname": "update_stock_levels",
+   "fieldtype": "Check",
+   "label": "Update Stock Levels",
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "default": "1",
+   "fieldname": "download_images",
+   "fieldtype": "Check",
+   "label": "Download Product Images",
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "fieldname": "column_break_20",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_customers",
+   "fieldtype": "Check",
+   "label": "Auto-create Customers",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_placeholder_items",
+   "fieldtype": "Check",
+   "label": "Create Placeholder Items",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  },
+  {
+   "default": "0",
+   "fieldname": "auto_submit_orders",
+   "fieldtype": "Check",
+   "label": "Auto-submit Sales Orders",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2025-10-15 00:00:00",
+ "modified_by": "Administrator",
+ "module": "Xml Importer",
+ "name": "XML Import Configuration",
+ "naming_rule": "By fieldname",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Sales Manager",
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
