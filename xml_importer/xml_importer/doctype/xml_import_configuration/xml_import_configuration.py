@@ -19,9 +19,32 @@ class XMLImportConfiguration(Document):
 			if self.import_type == "Items":
 				from xml_importer.xml_importer.item_importer import import_xml_items
 				result = import_xml_items(self.xml_feed_url, self.company)
+
+				# Create import log
+				from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_item_import_log
+				create_item_import_log(
+					xml_source=self.xml_feed_url,
+					status="Success" if result.get("success") else "Failed",
+					imported=result.get("imported", 0),
+					updated=result.get("updated", 0),
+					errors=result.get("errors", 0),
+					error_details="\n".join(result.get("error_messages", [])),
+					summary=result
+				)
 			elif self.import_type == "Orders":
 				from xml_importer.xml_importer.order_importer import import_xml_orders
 				result = import_xml_orders(self.xml_feed_url, self.company)
+
+				# Create import log
+				from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_order_import_log
+				create_order_import_log(
+					xml_source=self.xml_feed_url,
+					status="Success" if result.get("success") else "Failed",
+					imported=result.get("imported", 0),
+					errors=result.get("errors", 0),
+					error_details="\n".join(result.get("error_messages", [])),
+					summary=result
+				)
 			else:
 				frappe.throw(f"Import type '{self.import_type}' is not yet implemented")
 
