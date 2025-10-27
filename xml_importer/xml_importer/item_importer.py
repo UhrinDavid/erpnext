@@ -1375,41 +1375,119 @@ def import_xml_items(xml_source: str, company: str = None) -> Dict[str, Any]:
 
 def scheduled_xml_import():
     """
-    Scheduled function to import XML items
+    Scheduled function to import XML items based on configured frequency
+    This is called by the scheduler and checks each configuration's frequency setting
     """
-    # Get XML feed URL from XML Import Settings
-    if not frappe.db.exists("DocType", "XML Import Settings"):
-        frappe.logger().info("XML Import Settings doctype not found")
+    # Get all enabled XML Import Configurations
+    configs = frappe.get_all(
+        "XML Import Configuration",
+        filters={"enabled": 1},
+        fields=["name", "import_type", "xml_feed_url", "company", "import_frequency", "last_import"]
+    )
+
+    if not configs:
+        frappe.logger().debug("No enabled XML Import Configurations found")
         return
 
-    settings = frappe.get_single("XML Import Settings")
+    from datetime import datetime, timedelta
+    from frappe.utils import now_datetime, get_datetime
 
-    if not settings.enabled or not settings.xml_feed_url:
-        frappe.logger().info("XML import not enabled or URL not configured")
-        return
+    for config in configs:
+        try:
+            # Check if it's time to import based on frequency
+            if not should_run_import(config):
+                continue
 
-    try:
-        result = import_xml_items(settings.xml_feed_url, settings.company)
+            frappe.logger().info(f"Running scheduled import for {config.name} ({config.import_type})")
 
-        # Create import log using unified system
-        from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_item_import_log
+            if config.import_type == "Items":
+                result = import_xml_items(config.xml_feed_url, config.company)
 
-        log_doc = create_item_import_log(
-            xml_source=settings.xml_feed_url,
-            status="Success" if result.get("success") else "Failed",
-            imported=result.get("imported", 0),
-            updated=result.get("updated", 0),
-            errors=result.get("errors", 0),
-            error_details="\n".join(result.get("error_messages", [])),
-            summary=result
+                # Create import log
+                from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_item_import_log
+                create_item_import_log(
+                    xml_source=config.xml_feed_url,
+                    status="Success" if result.get("success") else "Failed",
+                    imported=result.get("imported", 0),
+                    updated=result.get("updated", 0),
+                    errors=result.get("errors", 0),
+                    error_details="\n".join(result.get("error_messages", [])),
+                    summary=result
+                )
+
+            elif config.import_type == "Orders":
+                from xml_importer.xml_importer.order_importer import import_xml_orders
+                result = import_xml_orders(config.xml_feed_url, config.company)
+
+                # Create import log
+                from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_order_import_log
+                create_order_import_log(
+                    xml_source=config.xml_feed_url,
+                    status="Success" if result.get("success") else "Failed",
+                    imported=result.get("imported", 0),
+                    errors=result.get("errors", 0),
+                    error_details="\n".join(result.get("error_messages", [])),
+                    summary=result
+                )
+
+            # Update last import time
+            frappe.db.set_value("XML Import Configuration", config.name, {
+                "last_import": now_datetime(),
+                "last_import_status": "Success" if result.get("success") else "Failed"
+            })
+            frappe.db.commit()
+
+        except Exception as e:
+            frappe.log_error(f"Scheduled XML import error for {config.name}: {str(e)}")
+            frappe.db.set_value("XML Import Configuration", config.name, {
+                "last_import": now_datetime(),
+                "last_import_status": "Failed"
+            })
+            frappe.db.commit()
+
+
+def should_run_import(config):
+    """
+    Check if import should run based on frequency setting and last import time
+    """
+    from frappe.utils import now_datetime, get_datetime
+    from datetime import timedelta
+
+    if not config.get("last_import"):
+        # Never imported before - run it
+        return True
+
+    last_import = get_datetime(config.last_import)
+    now = now_datetime()
+    time_diff = now - last_import
+
+    frequency = config.get("import_frequency", "Hourly")
+
+    # Map frequency to minutes
+    frequency_map = {
+        "Every 5 Minutes": 5,
+        "Every 10 Minutes": 10,
+        "Every 15 Minutes": 15,
+        "Every 30 Minutes": 30,
+        "Hourly": 60,
+        "Every 2 Hours": 120,
+        "Every 6 Hours": 360,
+        "Daily": 1440,
+        "Weekly": 10080
+    }
+
+    required_minutes = frequency_map.get(frequency, 60)  # Default to hourly
+    required_delta = timedelta(minutes=required_minutes)
+
+    should_run = time_diff >= required_delta
+
+    if should_run:
+        frappe.logger().info(
+            f"Import scheduled for {config.name}: Last import {time_diff.total_seconds()/60:.1f} mins ago, "
+            f"frequency is {frequency} ({required_minutes} mins)"
         )
 
-        # Send notification if configured
-        if settings.notification_emails and result.get("success"):
-            send_import_notification(result, settings.notification_emails)
-
-    except Exception as e:
-        frappe.log_error(f"Scheduled XML import error: {str(e)}")
+    return should_run
 
 
 def send_import_notification(result: Dict[str, Any], recipients: str):

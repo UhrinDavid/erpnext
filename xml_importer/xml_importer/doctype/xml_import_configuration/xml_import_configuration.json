@@ -68,11 +68,11 @@
    "label": "Import Configuration"
   },
   {
-   "default": "Daily",
+   "default": "Hourly",
    "fieldname": "import_frequency",
    "fieldtype": "Select",
    "label": "Import Frequency",
-   "options": "Hourly\nDaily\nWeekly"
+   "options": "Every 5 Minutes\nEvery 10 Minutes\nEvery 15 Minutes\nEvery 30 Minutes\nHourly\nEvery 2 Hours\nEvery 6 Hours\nDaily\nWeekly"
   },
   {
    "default": "1",
