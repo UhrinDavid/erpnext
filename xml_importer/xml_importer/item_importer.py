@@ -20,16 +20,18 @@ from typing import Dict, List, Optional, Any
 class XMLItemImporter:
     """Import items from XML feed into ERPNext"""
 
-    def __init__(self, xml_source: str = None, company: str = None):
+    def __init__(self, xml_source: str = None, company: str = None, config=None):
         """
         Initialize XML Item Importer
 
         Args:
             xml_source: URL or file path to XML feed
             company: Company name in ERPNext (default: default company)
+            config: XML Import Configuration document (optional)
         """
         self.xml_source = xml_source
         self.company = company or frappe.defaults.get_global_default("company")
+        self.config = config
         self.imported_count = 0
         self.updated_count = 0
         self.error_count = 0
@@ -543,6 +545,79 @@ class XMLItemImporter:
         """Add error to error list"""
         self.errors.append(error_msg)
         self.error_count += 1
+
+    def process_xml_content(self, xml_content: str) -> Dict[str, Any]:
+        """Process XML content directly (for pasted content debugging)"""
+        try:
+            frappe.logger().info("Processing pasted XML content for item import")
+
+            # Check if content is meaningful
+            if not xml_content or len(xml_content.strip()) < 50:
+                return {
+                    "success": False,
+                    "error": f"XML content is empty or too small: {len(xml_content) if xml_content else 0} bytes",
+                    "imported_items": [],
+                    "errors": ["Content too small or empty"]
+                }
+
+            # Parse XML
+            try:
+                root = ET.fromstring(xml_content.strip())
+                frappe.logger().info(f"Successfully parsed XML with root element: {root.tag}")
+            except ET.ParseError as e:
+                error_msg = f"Failed to parse XML: {str(e)}"
+                frappe.logger().error(error_msg)
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "imported_items": [],
+                    "errors": [error_msg]
+                }
+
+            # Process items
+            imported_items = []
+            processing_errors = []
+
+            # Find item elements (could be SHOPITEM, item, product, etc.)
+            item_elements = (root.findall('.//SHOPITEM') or
+                           root.findall('.//item') or
+                           root.findall('.//product'))
+            frappe.logger().info(f"Found {len(item_elements)} item elements to process")
+
+            for item_elem in item_elements:
+                try:
+                    item_doc = self.create_or_update_item(item_elem)
+                    if item_doc:
+                        imported_items.append(item_doc.item_code)
+                        frappe.logger().info(f"Successfully processed item: {item_doc.item_code}")
+                except Exception as e:
+                    error_msg = f"Failed to process item: {str(e)}"
+                    processing_errors.append(error_msg)
+                    frappe.logger().error(error_msg)
+
+            # Prepare summary
+            success = len(imported_items) > 0
+            summary = {
+                "success": success,
+                "imported_items": imported_items,
+                "errors": processing_errors,
+                "total_processed": len(item_elements),
+                "successfully_imported": len(imported_items),
+                "error_count": len(processing_errors)
+            }
+
+            frappe.logger().info(f"Pasted XML item processing completed: {summary}")
+            return summary
+
+        except Exception as e:
+            error_msg = f"XML content processing failed: {str(e)}"
+            frappe.log_error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "imported_items": [],
+                "errors": [error_msg]
+            }
 
     def import_from_xml(self) -> Dict[str, Any]:
         """Main import function"""

@@ -22,16 +22,18 @@ from datetime import datetime
 class XMLOrderImporter:
     """Import orders from XML feed into ERPNext Sales Orders"""
 
-    def __init__(self, xml_source: str = None, company: str = None):
+    def __init__(self, xml_source: str = None, company: str = None, config=None):
         """
         Initialize XML Order Importer
 
         Args:
             xml_source: URL or file path to XML feed
             company: Company name in ERPNext (default: default company)
+            config: XML Import Configuration document (optional)
         """
         self.xml_source = xml_source
         self.company = company or frappe.defaults.get_global_default("company")
+        self.config = config
         self.imported_count = 0
         self.updated_count = 0
         self.error_count = 0
@@ -63,6 +65,59 @@ class XMLOrderImporter:
             })
             territory.insert(ignore_permissions=True)
 
+    def map_country_name(self, country_name: str) -> str:
+        """Map Slovak/local country names to ERPNext country names"""
+        if not country_name:
+            return "Slovakia"  # Default country
+
+        country_mapping = {
+            # Slovak to English mappings
+            "Slovensko": "Slovakia",
+            "Česko": "Czech Republic",
+            "Česká republika": "Czech Republic",
+            "Rakúsko": "Austria",
+            "Nemecko": "Germany",
+            "Poľsko": "Poland",
+            "Maďarsko": "Hungary",
+            "Ukrajina": "Ukraine",
+            "Francúzsko": "France",
+            "Taliansko": "Italy",
+            "Španielsko": "Spain",
+            "Portugalsko": "Portugal",
+            "Holandsko": "Netherlands",
+            "Belgicko": "Belgium",
+            "Švajčiarsko": "Switzerland",
+
+            # Common variations
+            "SK": "Slovakia",
+            "CZ": "Czech Republic",
+            "AT": "Austria",
+            "DE": "Germany",
+            "PL": "Poland",
+            "HU": "Hungary",
+            "UA": "Ukraine",
+            "FR": "France",
+            "IT": "Italy",
+            "ES": "Spain",
+            "PT": "Portugal",
+            "NL": "Netherlands",
+            "BE": "Belgium",
+            "CH": "Switzerland"
+        }
+
+        # Try exact match first
+        mapped_country = country_mapping.get(country_name.strip())
+        if mapped_country:
+            return mapped_country
+
+        # Try case-insensitive match
+        for slovak_name, english_name in country_mapping.items():
+            if slovak_name.lower() == country_name.lower().strip():
+                return english_name
+
+        # If no mapping found, return original (might be already in English)
+        return country_name.strip()
+
     def fetch_xml_content(self) -> str:
         """Fetch XML content from URL or file"""
         try:
@@ -70,11 +125,20 @@ class XMLOrderImporter:
                 # Fetch from URL
                 response = requests.get(self.xml_source, timeout=60)
                 response.raise_for_status()
-                return response.text
+                content = response.text
+
+                # Log content details for debugging
+                content_length = len(content)
+                frappe.logger().info(f"Fetched XML content: {content_length} bytes from {self.xml_source}")
+                frappe.log_error(f"Order Import - XML Content ({content_length} bytes): {content[:500]}...", "Order Import Content")
+
+                return content
             else:
                 # Read from file
                 with open(self.xml_source, 'r', encoding='utf-8') as f:
-                    return f.read()
+                    content = f.read()
+                    frappe.logger().info(f"Read XML content: {len(content)} bytes from file {self.xml_source}")
+                    return content
         except Exception as e:
             frappe.throw(f"Failed to fetch XML content: {str(e)}")
 
@@ -174,7 +238,7 @@ class XMLOrderImporter:
                     'house_number': self.get_element_text(billing_elem, 'HOUSENUMBER'),
                     'city': self.get_element_text(billing_elem, 'CITY'),
                     'postal_code': self.get_element_text(billing_elem, 'ZIP'),
-                    'country': self.get_element_text(billing_elem, 'COUNTRY'),
+                    'country': self.map_country_name(self.get_element_text(billing_elem, 'COUNTRY')),
                     'company_id': self.get_element_text(billing_elem, 'COMPANY_ID'),
                     'vat_id': self.get_element_text(billing_elem, 'VAT_ID'),
                     'customer_id_number': self.get_element_text(billing_elem, 'CUSTOMER_IDENTIFICATION_NUMBER')
@@ -190,7 +254,7 @@ class XMLOrderImporter:
                     'house_number': self.get_element_text(shipping_elem, 'HOUSENUMBER'),
                     'city': self.get_element_text(shipping_elem, 'CITY'),
                     'postal_code': self.get_element_text(shipping_elem, 'ZIP'),
-                    'country': self.get_element_text(shipping_elem, 'COUNTRY')
+                    'country': self.map_country_name(self.get_element_text(shipping_elem, 'COUNTRY'))
                 }
 
         # Order details
@@ -391,8 +455,14 @@ class XMLOrderImporter:
                 self.add_error("Missing external order ID")
                 return False
 
+            # Skip cancelled/storno orders
+            order_status = order_data.get('order_status', '').lower()
+            if 'storno' in order_status or 'cancel' in order_status or 'zrušen' in order_status:
+                frappe.logger().info(f"Skipping cancelled order {external_order_id} with status: {order_data.get('order_status')}")
+                return True
+
             # Check if order exists
-            existing_order = frappe.db.get_value("Sales Order", {"custom_external_order_id": external_order_id}, "name")
+            existing_order = frappe.db.get_value("Sales Order", {"po_no": external_order_id}, "name")
 
             if existing_order:
                 # Skip if order already exists
@@ -414,28 +484,43 @@ class XMLOrderImporter:
             sales_order.currency = order_data.get('currency_code', 'EUR')
             sales_order.selling_price_list = "Standard Selling"
 
-            # Custom fields for order tracking
-            sales_order.custom_external_order_id = external_order_id
-            sales_order.custom_order_code = order_data.get('order_code')
-            sales_order.custom_order_status = order_data.get('order_status')
-            sales_order.custom_source_name = order_data.get('source_name')
+            # Use po_no field for external order ID tracking (standard ERPNext field)
+            sales_order.po_no = external_order_id
+            sales_order.po_date = order_date.date()
 
             # Add customer remarks
             if order_data.get('customer_remark'):
-                sales_order.custom_customer_remark = order_data.get('customer_remark')
+                sales_order.remarks = order_data.get('customer_remark')
 
             # Process order items
+            product_items_added = 0
             for item_data in order_data.get('order_items', []):
                 # Only add product items to sales order
                 if item_data.get('item_type') == 'product':
-                    self.add_order_item(sales_order, item_data)
+                    if self.add_order_item(sales_order, item_data):
+                        product_items_added += 1
+
+            # Only create order if we have product items
+            if product_items_added == 0:
+                frappe.logger().info(f"No valid product items found for order {external_order_id}, skipping")
+                return True
 
             # Set totals
             sales_order.run_method("calculate_taxes_and_totals")
 
             # Save order
             sales_order.insert(ignore_permissions=True)
-            sales_order.submit()
+
+            # Auto-submit if configuration allows
+            if self.config and self.config.get('auto_submit_orders'):
+                try:
+                    sales_order.submit()
+                    frappe.logger().info(f"Auto-submitted Sales Order: {sales_order.name}")
+                except Exception as e:
+                    frappe.logger().warning(f"Failed to auto-submit order {sales_order.name}: {str(e)}")
+                    # Continue even if submit fails - order is still created
+            else:
+                frappe.logger().info(f"Order {sales_order.name} saved as draft (auto-submit disabled)")
 
             self.imported_count += 1
             frappe.logger().info(f"Created Sales Order: {sales_order.name} for external order {external_order_id}")
@@ -449,17 +534,19 @@ class XMLOrderImporter:
             frappe.log_error(error_msg)
             return False
 
-    def add_order_item(self, sales_order: Document, item_data: Dict[str, Any]):
+    def add_order_item(self, sales_order: Document, item_data: Dict[str, Any]) -> bool:
         """Add item to sales order"""
         try:
             item_code = item_data.get('item_code')
             if not item_code:
-                return
+                frappe.logger().warning(f"No item code found for item: {item_data.get('item_name')}")
+                return False
 
             # Check if item exists in ERPNext
             if not frappe.db.exists("Item", item_code):
                 # Create a placeholder item if it doesn't exist
-                self.create_placeholder_item(item_code, item_data)
+                if not self.create_placeholder_item(item_code, item_data):
+                    return False
 
             # Add item to sales order
             item_row = sales_order.append("items", {})
@@ -467,41 +554,171 @@ class XMLOrderImporter:
             item_row.item_name = item_data.get('item_name', item_code)
             item_row.qty = item_data.get('quantity', 1)
             item_row.rate = item_data.get('unit_price_without_tax', 0)
-            item_row.amount = item_data.get('total_price_without_tax', 0)
+
+            # If rate is 0, try to get it from with_tax price
+            if item_row.rate == 0:
+                item_row.rate = item_data.get('unit_price_with_tax', 0)
+
+            # Calculate amount
+            item_row.amount = item_row.qty * item_row.rate
+
+            # Set UOM
+            uom = item_data.get('unit', 'Nos')
+            if uom == 'ks':  # Slovak for pieces
+                uom = 'Nos'
+            item_row.uom = uom
 
             # Set warehouse (get default)
             default_warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
             if default_warehouse:
                 item_row.warehouse = default_warehouse
 
+            frappe.logger().info(f"Added item {item_code} to sales order")
+            return True
+
         except Exception as e:
             frappe.log_error(f"Failed to add order item {item_data.get('item_code')}: {str(e)}")
+            return False
 
-    def create_placeholder_item(self, item_code: str, item_data: Dict[str, Any]):
+    def create_placeholder_item(self, item_code: str, item_data: Dict[str, Any]) -> bool:
         """Create placeholder item if it doesn't exist"""
         try:
+            # Clean item name
+            item_name = item_data.get('item_name', item_code)
+            if len(item_name) > 140:  # ERPNext limit
+                item_name = item_name[:137] + "..."
+
             item_doc = frappe.get_doc({
                 "doctype": "Item",
                 "item_code": item_code,
-                "item_name": item_data.get('item_name', item_code),
+                "item_name": item_name,
                 "item_group": "All Item Groups",
                 "stock_uom": "Nos",
                 "is_stock_item": 1,
                 "is_sales_item": 1,
                 "is_purchase_item": 0,
-                "description": f"Auto-created from order import - {item_data.get('item_name', '')}"
+                "description": f"Auto-created from order import: {item_name}"
             })
+
+            # Add barcode if available
+            if item_data.get('barcode'):
+                item_doc.append("barcodes", {
+                    "barcode": item_data.get('barcode'),
+                    "barcode_type": "EAN"
+                })
 
             item_doc.insert(ignore_permissions=True)
             frappe.logger().info(f"Created placeholder item: {item_code}")
+            return True
 
         except Exception as e:
             frappe.log_error(f"Failed to create placeholder item {item_code}: {str(e)}")
+            return False
 
     def add_error(self, error_msg: str) -> None:
         """Add error to error list"""
         self.errors.append(error_msg)
         self.error_count += 1
+
+    def process_xml_content(self, xml_content: str) -> Dict[str, Any]:
+        """Process XML content directly (for pasted content debugging)"""
+        try:
+            frappe.logger().info("Processing pasted XML content for order import")
+
+            # Check if content is meaningful
+            if not xml_content or len(xml_content.strip()) < 50:
+                return {
+                    "success": False,
+                    "error": f"XML content is empty or too small: {len(xml_content) if xml_content else 0} bytes",
+                    "imported_orders": [],
+                    "errors": ["Content too small or empty"]
+                }
+
+            # Parse XML
+            try:
+                root = ET.fromstring(xml_content.strip())
+                frappe.logger().info(f"Successfully parsed XML with root element: {root.tag}")
+            except ET.ParseError as e:
+                error_msg = f"Failed to parse XML: {str(e)}"
+                frappe.logger().error(error_msg)
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "imported_orders": [],
+                    "errors": [error_msg]
+                }
+
+            # Process orders
+            imported_orders = []
+            processing_errors = []
+
+            # Find order elements - try multiple possible names
+            order_elements = (root.findall('.//order') or
+                            root.findall('.//Order') or
+                            root.findall('.//ORDER') or
+                            root.findall('.//objednavka') or  # Slovak for order
+                            root.findall('.//OBJEDNAVKA'))
+
+            # If still no elements found and root is ORDERS, check direct children
+            if not order_elements and root.tag.upper() == 'ORDERS':
+                order_elements = [child for child in root if child.tag.lower() in ['order', 'objednavka'] or 'order' in child.tag.lower()]
+
+            frappe.logger().info(f"Found {len(order_elements)} order elements to process")
+            frappe.logger().info(f"Root tag: {root.tag}, Direct children: {[child.tag for child in root[:5]]}")  # Log first 5 children
+
+            for i, order_elem in enumerate(order_elements, 1):
+                try:
+                    frappe.logger().info(f"Processing order {i}/{len(order_elements)}")
+
+                    # Get order ID for debugging
+                    order_id = (order_elem.findtext('ORDER_ID') or
+                               order_elem.findtext('order_id') or
+                               order_elem.findtext('ID') or
+                               f"order_{i}")
+
+                    frappe.logger().info(f"Processing order with ID: {order_id}")
+
+                    # Parse XML element to dictionary first
+                    order_data = self.parse_order(order_elem)
+                    success = self.create_or_update_order(order_data)
+                    if success:
+                        imported_orders.append(order_id)
+                        frappe.logger().info(f"Successfully processed order: {order_id}")
+                        self.imported_count += 1
+                    else:
+                        error_msg = f"Failed to create order document for order ID: {order_id}"
+                        processing_errors.append(error_msg)
+                        frappe.logger().warning(error_msg)
+
+                except Exception as e:
+                    error_msg = f"Failed to process order {order_id if 'order_id' in locals() else i}: {str(e)}"
+                    processing_errors.append(error_msg)
+                    frappe.logger().error(error_msg)
+                    frappe.log_error(f"Order processing error: {str(e)}", "XML Order Import")
+
+            # Prepare summary
+            success = len(imported_orders) > 0
+            summary = {
+                "success": success,
+                "imported_orders": imported_orders,
+                "errors": processing_errors,
+                "total_processed": len(order_elements),
+                "successfully_imported": len(imported_orders),
+                "error_count": len(processing_errors)
+            }
+
+            frappe.logger().info(f"Pasted XML order processing completed: {summary}")
+            return summary
+
+        except Exception as e:
+            error_msg = f"XML content processing failed: {str(e)}"
+            frappe.log_error(error_msg)
+            return {
+                "success": False,
+                "error": error_msg,
+                "imported_orders": [],
+                "errors": [error_msg]
+            }
 
     def import_from_xml(self) -> Dict[str, Any]:
         """Main import function"""
@@ -510,6 +727,20 @@ class XMLOrderImporter:
 
             # Fetch and parse XML
             xml_content = self.fetch_xml_content()
+
+            # Check if content is meaningful
+            if not xml_content or len(xml_content.strip()) < 50:
+                frappe.logger().warning(f"XML content is empty or too small: {len(xml_content) if xml_content else 0} bytes")
+                return {
+                    "success": True,  # It's "successful" but no data to process
+                    "imported": 0,
+                    "updated": 0,
+                    "errors": 0,
+                    "error_messages": ["XML feed returned empty or minimal content"],
+                    "total_processed": 0,
+                    "successfully_processed": 0
+                }
+
             root = self.parse_xml(xml_content)
 
             # Find all ORDER elements
@@ -518,12 +749,27 @@ class XMLOrderImporter:
             frappe.logger().info(f"Found {len(orders)} orders to process")
 
             # Process each order
+            processed_count = 0
             for order in orders:
                 try:
                     order_data = self.parse_order(order)
-                    self.create_or_update_order(order_data)
+                    order_id = order_data.get('external_order_id', 'Unknown')
+                    order_status = order_data.get('order_status', 'Unknown')
+
+                    frappe.logger().info(f"Processing order {order_id} with status: {order_status}")
+
+                    # Log order items for debugging
+                    items = order_data.get('order_items', [])
+                    product_items = [item for item in items if item.get('item_type') == 'product']
+                    frappe.logger().info(f"Order {order_id} has {len(items)} total items, {len(product_items)} product items")
+
+                    if self.create_or_update_order(order_data):
+                        processed_count += 1
+
                 except Exception as e:
-                    self.add_error(f"Error processing ORDER ID {order.get('ORDER_ID', 'Unknown')}: {str(e)}")
+                    error_msg = f"Error processing ORDER ID {order.find('ORDER_ID').text if order.find('ORDER_ID') is not None else 'Unknown'}: {str(e)}"
+                    self.add_error(error_msg)
+                    frappe.log_error(error_msg)
                     continue
 
             # Return summary
@@ -533,7 +779,8 @@ class XMLOrderImporter:
                 "updated": self.updated_count,
                 "errors": self.error_count,
                 "error_messages": self.errors[:10],  # First 10 errors
-                "total_processed": len(orders)
+                "total_processed": len(orders),
+                "successfully_processed": processed_count
             }
 
             frappe.logger().info(f"Order import completed: {summary}")
