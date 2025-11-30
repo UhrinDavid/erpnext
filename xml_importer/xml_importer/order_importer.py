@@ -811,6 +811,9 @@ def import_xml_orders(xml_source: str, company: str = None) -> Dict[str, Any]:
     Returns:
         Dict with import results
     """
+    # Set timeout to 1 hour for manual XML imports
+    frappe.local.request_timeout = 3600
+
     importer = XMLOrderImporter(xml_source, company)
     return importer.import_from_xml()
 

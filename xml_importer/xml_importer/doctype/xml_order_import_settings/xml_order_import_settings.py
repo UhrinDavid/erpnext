@@ -61,6 +61,9 @@ class XMLOrderImportSettings(Document):
 	@frappe.whitelist()
 	def trigger_manual_import(self):
 		"""Manually trigger XML order import"""
+		# Set timeout to 1 hour for manual XML imports
+		frappe.local.request_timeout = 3600
+
 		if not self.enabled:
 			frappe.throw("XML Order Import is not enabled. Please enable it first.")
 
