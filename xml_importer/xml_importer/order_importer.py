@@ -802,7 +802,10 @@ class XMLOrderImporter:
 @frappe.whitelist()
 def import_xml_orders(xml_source: str, company: str = None) -> Dict[str, Any]:
     """
-    Import orders from XML feed
+    Import orders from XML feed using SAX parser with Redis queue
+
+    This function now always uses the memory-optimized SAX parser with Redis queue
+    instead of the DOM-based ElementTree parser.
 
     Args:
         xml_source: URL or file path to XML feed
@@ -811,11 +814,291 @@ def import_xml_orders(xml_source: str, company: str = None) -> Dict[str, Any]:
     Returns:
         Dict with import results
     """
-    # Set timeout to 1 hour for manual XML imports
-    frappe.local.request_timeout = 3600
+    # Always use SAX parser with Redis queue for memory efficiency
+    return import_xml_orders_sax(xml_source, company)
 
-    importer = XMLOrderImporter(xml_source, company)
-    return importer.import_from_xml()
+
+# ================================
+# SAX PARSER IMPLEMENTATION FOR ORDERS
+# ================================
+
+import xml.sax
+import redis
+import json
+import time
+import os
+import gc
+import psutil
+from datetime import datetime
+
+try:
+    REDIS_AVAILABLE = True
+    import redis
+except ImportError:
+    REDIS_AVAILABLE = False
+
+
+class SAXOrderHandler(xml.sax.ContentHandler):
+    """SAX handler for processing XML order data"""
+
+    def __init__(self, redis_client=None, queue_name=None):
+        self.redis_client = redis_client
+        self.queue_name = queue_name or f"xml_orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.current_order = {}
+        self.current_element = ""
+        self.current_text = ""
+        self.orders_processed = 0
+
+    def startElement(self, name, attrs):
+        self.current_element = name.upper()
+        if name.upper() == "ORDER":
+            self.current_order = {}
+
+    def endElement(self, name):
+        if name.upper() == "ORDER" and self.current_order:
+            # Queue order for processing
+            if self.redis_client:
+                order_json = json.dumps(self.current_order)
+                self.redis_client.lpush(self.queue_name, order_json)
+            self.orders_processed += 1
+            self.current_order = {}
+        elif self.current_element in ["ORDER_ID", "CUSTOMER_NAME", "CUSTOMER_EMAIL", "ORDER_STATUS", "ORDER_DATE", "TOTAL_AMOUNT"]:
+            self.current_order[self.current_element.lower()] = self.current_text.strip()
+
+        self.current_element = ""
+        self.current_text = ""
+
+    def characters(self, content):
+        self.current_text += content
+
+
+def get_redis_client():
+    """Get Redis client connection"""
+    if not REDIS_AVAILABLE:
+        frappe.throw("Redis package not installed. Install with: pip install redis")
+
+    try:
+        # Get Redis configuration from Frappe
+        redis_config = frappe.conf.get("redis_queue") or frappe.conf.get("redis_cache")
+
+        if isinstance(redis_config, str):
+            return redis.from_url(redis_config)
+        elif isinstance(redis_config, dict):
+            return redis.Redis(**redis_config)
+        else:
+            return redis.Redis(host='localhost', port=6379, db=0)
+
+    except Exception as e:
+        frappe.log_error(f"Redis connection error: {str(e)}")
+        return redis.Redis(host='localhost', port=6379, db=0)
+
+
+@frappe.whitelist()
+def import_xml_orders_sax(xml_source: str, company: str = None) -> Dict[str, Any]:
+    """
+    Import orders from XML feed using SAX parser with Redis queue
+
+    Args:
+        xml_source: URL or file path to XML feed
+        company: Company name (optional)
+
+    Returns:
+        Dict with import results
+    """
+    try:
+        result = _import_xml_orders_sax_internal(xml_source, company)
+
+        # Create import log when running as background job
+        if frappe.local.job:
+            _create_order_import_log_from_result(xml_source, result)
+            _update_order_config_status(xml_source, result)
+
+        return result
+
+    except Exception as e:
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "imported": 0,
+            "updated": 0,
+            "errors": 1,
+            "error_messages": [str(e)]
+        }
+
+        # Log error when running as background job
+        if frappe.local.job:
+            _create_order_import_log_from_result(xml_source, error_result)
+            _update_order_config_status(xml_source, error_result)
+
+        raise
+
+
+def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dict[str, Any]:
+    """
+    Import orders from XML feed using SAX parser with Redis queue
+
+    Args:
+        xml_source: URL or file path to XML feed
+        company: Company name (optional)
+
+    Returns:
+        Dict with import results
+    """
+    try:
+        frappe.logger().info(f"Starting SAX-based XML order import from: {xml_source}")
+
+        # Create importer to use existing functionality
+        importer = XMLOrderImporter(xml_source, company)
+
+        # Fetch XML content
+        xml_content = importer.fetch_xml_content()
+
+        # Always use Redis for memory efficiency
+        if not REDIS_AVAILABLE:
+            frappe.throw("Redis package not installed. Install with: pip install redis")
+
+        redis_client = get_redis_client()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        queue_name = f"xml_orders_{timestamp}"
+
+        # Phase 1: Parse XML with SAX and queue orders
+        frappe.logger().info("Phase 1: Parsing XML and queueing orders...")
+        handler = SAXOrderHandler(redis_client, queue_name)
+        parser = xml.sax.make_parser()
+        parser.setContentHandler(handler)
+
+        from io import StringIO
+        parser.parse(StringIO(xml_content))
+
+        frappe.logger().info(f"Queued {handler.orders_processed} orders for processing")
+
+        # Phase 2: Process queued orders
+        frappe.logger().info("Phase 2: Processing queued orders...")
+        processed_count = 0
+        imported_count = 0
+        updated_count = 0
+        error_count = 0
+        errors = []
+
+        while True:
+            # Get order from queue
+            order_data = redis_client.rpop(handler.queue_name)
+            if not order_data:
+                break
+
+            try:
+                order_dict = json.loads(order_data.decode('utf-8'))
+
+                # Convert SAX format to legacy format for processing
+                legacy_order = convert_sax_order_to_legacy_format(order_dict)
+
+                # Process the order using existing methods
+                result = importer.create_or_update_order(legacy_order)
+
+                if result and result.get("created"):
+                    imported_count += 1
+                elif result and result.get("updated"):
+                    updated_count += 1
+
+                processed_count += 1
+
+                # Progress update every 100 orders
+                if processed_count % 100 == 0:
+                    frappe.publish_realtime(
+                        "sax_order_import_progress",
+                        {
+                            "phase": "processing",
+                            "processed": processed_count,
+                            "imported": imported_count,
+                            "updated": updated_count,
+                            "errors": error_count
+                        },
+                        user=frappe.session.user
+                    )
+
+            except Exception as e:
+                error_count += 1
+                error_msg = f"Error processing order {processed_count + 1}: {str(e)}"
+                errors.append(error_msg)
+                frappe.log_error(error_msg)
+
+        # Clean up queue
+        redis_client.delete(handler.queue_name)
+
+        # Final result
+        result = {
+            "success": True,
+            "imported": imported_count,
+            "updated": updated_count,
+            "errors": error_count,
+            "error_messages": errors,
+            "total_processed": processed_count,
+            "method": "SAX with Redis queue"
+        }
+
+        frappe.logger().info(f"SAX order import completed: {result}")
+        return result
+
+    except Exception as e:
+        error_msg = f"SAX XML order import failed: {str(e)}"
+        frappe.log_error(error_msg)
+        return {
+            "success": False,
+            "error": error_msg,
+            "imported": 0,
+            "updated": 0,
+            "errors": 1,
+            "error_messages": [error_msg]
+        }
+
+
+def convert_sax_order_to_legacy_format(sax_order_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert SAX-parsed order data to legacy format"""
+    return {
+        "order_id": sax_order_data.get("order_id", ""),
+        "customer_name": sax_order_data.get("customer_name", ""),
+        "customer_email": sax_order_data.get("customer_email", ""),
+        "order_status": sax_order_data.get("order_status", ""),
+        "order_date": sax_order_data.get("order_date", ""),
+        "total_amount": sax_order_data.get("total_amount", ""),
+        "additional_data": sax_order_data.get("additional_data", {})
+    }
+
+
+def _create_order_import_log_from_result(xml_source: str, result: Dict[str, Any]):
+    """Create order import log entry from result"""
+    try:
+        from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_order_import_log
+        create_order_import_log(
+            xml_source=xml_source,
+            status="Success" if result.get("success") else "Failed",
+            imported=result.get("imported", 0),
+            updated=result.get("updated", 0),
+            errors=result.get("errors", 0),
+            error_details="\n".join(result.get("error_messages", [])),
+            summary=result
+        )
+    except Exception as e:
+        frappe.log_error(f"Failed to create order import log: {str(e)}")
+
+
+def _update_order_config_status(xml_source: str, result: Dict[str, Any]):
+    """Update order configuration status based on result"""
+    try:
+        # Find configuration by XML feed URL
+        configs = frappe.get_all(
+            "XML Import Configuration",
+            filters={"xml_feed_url": xml_source, "import_type": "Orders"},
+            fields=["name"]
+        )
+
+        for config in configs:
+            config_doc = frappe.get_doc("XML Import Configuration", config.name)
+            config_doc.db_set("last_import", frappe.utils.now())
+            config_doc.db_set("last_import_status", "Success" if result.get("success") else "Failed")
+
+    except Exception as e:
+        frappe.log_error(f"Failed to update order config status: {str(e)}")
 
 
 def scheduled_xml_order_import():

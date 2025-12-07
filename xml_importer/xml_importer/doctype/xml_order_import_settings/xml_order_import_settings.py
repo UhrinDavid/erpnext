@@ -60,57 +60,102 @@ class XMLOrderImportSettings(Document):
 
 	@frappe.whitelist()
 	def trigger_manual_import(self):
-		"""Manually trigger XML order import"""
-		# Set timeout to 1 hour for manual XML imports
-		frappe.local.request_timeout = 3600
-
+		"""Manually trigger XML order import using SAX parser with Redis queue"""
 		if not self.enabled:
 			frappe.throw("XML Order Import is not enabled. Please enable it first.")
 
 		if not self.xml_feed_url:
 			frappe.throw("XML Feed URL is required")
 
-		from xml_importer.xml_importer.order_importer import import_xml_orders
+		from xml_importer.xml_importer.order_importer import import_xml_orders_sax
 
 		try:
-			# Run the import
-			result = import_xml_orders(self.xml_feed_url, self.company)
+			# Run the import using SAX parser with Redis queue
+			result = import_xml_orders_sax(self.xml_feed_url, self.company)
 
 			# Update last import status
 			self.db_set("last_import", frappe.utils.now())
 			self.db_set("last_import_status", "Success" if result.get("success") else "Failed")
 
-			# Create import log entry
-			from xml_importer.xml_importer.doctype.xml_order_import_log.xml_order_import_log import create_import_log
-			create_import_log(
-				import_type="Orders",
-				xml_source=self.xml_feed_url,
-				status="Success" if result.get("success") else "Failed",
-				imported=result.get("imported", 0),
-				updated=result.get("updated", 0),
-				errors=result.get("errors", 0),
-				error_details="\n".join(result.get("error_messages", [])),
-				summary=result
-			)
-
-			if result.get("success"):
-				return {
-					"success": True,
-					"message": f"Import completed successfully!\n\nOrders imported: {result.get('imported', 0)}\nOrders updated: {result.get('updated', 0)}\nErrors: {result.get('errors', 0)}",
-					"result": result
-				}
-			else:
-				return {
-					"success": False,
-					"message": f"Import failed: {result.get('error', 'Unknown error')}",
-					"result": result
-				}
+			return {
+				"success": True,
+				"message": f"Import completed successfully! Imported: {result.get('imported', 0)}, Updated: {result.get('updated', 0)}, Errors: {result.get('errors', 0)}",
+				"result": result
+			}
 
 		except Exception as e:
 			error_msg = f"Manual order import failed: {str(e)}"
 			frappe.log_error(error_msg)
+
+			# Update last import status
 			self.db_set("last_import_status", "Failed")
+
 			return {
 				"success": False,
 				"message": error_msg
 			}
+
+		# Update status to show import is running
+		self.db_set("last_import", frappe.utils.now())
+		self.db_set("last_import_status", "Running")
+
+		frappe.msgprint(
+			f"Order import job started in background. Job ID: {job_id}. "
+			f"You can check the progress in the background jobs list.",
+			title="Import Started",
+			indicator="blue"
+		)
+
+		return {"success": True, "job_id": job_id, "status": "started"}
+
+def execute_background_order_import(xml_feed_url, company, config_name):
+	"""Execute the actual order import in background"""
+	try:
+		from xml_importer.xml_importer.order_importer import import_xml_orders
+		result = import_xml_orders(xml_feed_url, company)
+
+		# Update the configuration document with results
+		config_doc = frappe.get_doc("XML Order Import Settings", config_name)
+		config_doc.db_set("last_import_status", "Success" if result.get("success") else "Failed")
+
+		# Create import log entry
+		from xml_importer.xml_importer.doctype.xml_order_import_log.xml_order_import_log import create_import_log
+		create_import_log(
+			import_type="Orders",
+			xml_source=xml_feed_url,
+			status="Success" if result.get("success") else "Failed",
+			imported=result.get("imported", 0),
+			updated=result.get("updated", 0),
+			errors=result.get("errors", 0),
+			error_details="\n".join(result.get("error_messages", [])),
+			summary=result
+		)
+
+		frappe.publish_realtime(
+			"order_import_completed",
+			{
+				"success": result.get("success"),
+				"imported": result.get("imported", 0),
+				"updated": result.get("updated", 0),
+				"errors": result.get("errors", 0)
+			},
+			user=frappe.session.user
+		)
+
+		return result
+
+	except Exception as e:
+		error_msg = f"Background order import failed: {str(e)}"
+		frappe.log_error(error_msg)
+
+		# Update configuration status
+		config_doc = frappe.get_doc("XML Order Import Settings", config_name)
+		config_doc.db_set("last_import_status", "Failed")
+
+		frappe.publish_realtime(
+			"order_import_failed",
+			{"error": str(e)},
+			user=frappe.session.user
+		)
+
+		raise

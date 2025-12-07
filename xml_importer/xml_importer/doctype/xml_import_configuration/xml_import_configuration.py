@@ -16,53 +16,67 @@ class XMLImportConfiguration(Document):
 			frappe.throw("XML Feed URL is required")
 
 		try:
+			# Always use SAX parser with Redis queue for memory efficiency
+			use_queue = True
+
 			if self.import_type == "Items":
-				from xml_importer.xml_importer.item_importer import import_xml_items
-				result = import_xml_items(self.xml_feed_url, self.company)
-
-				# Create import log
-				from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_item_import_log
-				create_item_import_log(
+				# Enqueue background job for items
+				job = frappe.enqueue(
+					'xml_importer.xml_importer.item_importer.import_xml_items_sax',
+					queue='long',
+					timeout=3600,  # 1 hour timeout
+					job_name=f"XML Item Import - {self.name}",
 					xml_source=self.xml_feed_url,
-					status="Success" if result.get("success") else "Failed",
-					imported=result.get("imported", 0),
-					updated=result.get("updated", 0),
-					errors=result.get("errors", 0),
-					error_details="\n".join(result.get("error_messages", [])),
-					summary=result
+					company=self.company,
+					use_queue=use_queue
 				)
+
+				# Update configuration with job info
+				self.db_set("last_import", frappe.utils.now())
+				self.db_set("last_import_status", "Running")
+
+				return {
+					"success": True,
+					"message": f"Item import job started successfully. Job ID: {job.id}",
+					"job_id": job.id,
+					"status": "queued"
+				}
+
 			elif self.import_type == "Orders":
-				from xml_importer.xml_importer.order_importer import import_xml_orders
-				result = import_xml_orders(self.xml_feed_url, self.company)
-
-				# Create import log
-				from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_order_import_log
-				create_order_import_log(
+				# Enqueue background job for orders
+				job = frappe.enqueue(
+					'xml_importer.xml_importer.order_importer.import_xml_orders_sax',
+					queue='long',
+					timeout=3600,  # 1 hour timeout
+					job_name=f"XML Order Import - {self.name}",
 					xml_source=self.xml_feed_url,
-					status="Success" if result.get("success") else "Failed",
-					imported=result.get("imported", 0),
-					errors=result.get("errors", 0),
-					error_details="\n".join(result.get("error_messages", [])),
-					summary=result
+					company=self.company
 				)
+
+				# Update configuration with job info
+				self.db_set("last_import", frappe.utils.now())
+				self.db_set("last_import_status", "Running")
+
+				return {
+					"success": True,
+					"message": f"Order import job started successfully. Job ID: {job.id}",
+					"job_id": job.id,
+					"status": "queued"
+				}
 			else:
-				frappe.throw(f"Import type '{self.import_type}' is not yet implemented")
-
-			# Update last import status
-			self.db_set("last_import", now())
-			self.db_set("last_import_status", "Success" if result.get("success") else "Failed")
-
-			return {
-				"success": True,
-				"message": f"Import completed successfully. Imported: {result.get('imported', 0)}, Errors: {result.get('errors', 0)}",
-				"result": result
-			}
+				frappe.throw("Unsupported import type")
 
 		except Exception as e:
-			self.db_set("last_import", now())
+			error_msg = f"Failed to queue import job: {str(e)}"
+			frappe.log_error(error_msg)
+
+			# Update status
 			self.db_set("last_import_status", "Failed")
-			frappe.log_error(f"Manual import failed: {str(e)}")
-			frappe.throw(f"Import failed: {str(e)}")
+
+			return {
+				"success": False,
+				"message": error_msg
+			}
 
 	@frappe.whitelist()
 	def aggressive_import_check(self):

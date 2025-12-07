@@ -9,13 +9,29 @@ License: MIT
 import frappe
 import requests
 import xml.etree.ElementTree as ET
+import xml.sax
+import traceback
 from frappe.model.document import Document
 from frappe.utils import now, cstr, flt, cint, strip_html_tags
 from frappe.utils.file_manager import save_file
 import re
 import os
+import json
+import uuid
+import time
+import gc
+import psutil
 from urllib.parse import urlparse
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
+from datetime import datetime
+
+# Redis import with fallback
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    redis = None
 
 class XMLItemImporter:
     """Import items from XML feed into ERPNext"""
@@ -93,37 +109,20 @@ class XMLItemImporter:
             frappe.throw(f"XML parsing failed: {str(e)}")
 
     def clean_html_content(self, content: str) -> str:
-        """Clean HTML content and extract text"""
-        if not content:
-            return ""
+        """Pass-through - return as-is"""
+        return content or ""
 
-        # Remove CDATA
-        content = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\1', content, flags=re.DOTALL)
-
-        # Strip HTML tags but preserve line breaks
-        content = strip_html_tags(content)
-
-        # Clean up extra whitespace
-        content = re.sub(r'\s+', ' ', content).strip()
-
-        return content
+    def clean_text_content(self, content: str) -> str:
+        """Pass-through - return as-is"""
+        return content or ""
 
     def clean_name(self, name: str) -> str:
-        """Clean name to remove invalid characters"""
-        if not name:
-            return ""
+        """Pass-through - return as-is"""
+        return name or ""
 
-        # Remove HTML tags first
-        name = strip_html_tags(name)
-
-        # Remove special characters that ERPNext doesn't allow in names
-        name = re.sub(r'[<>&"\']', '', name)
-
-        # Replace multiple spaces with single space
-        name = re.sub(r'\s+', ' ', name)
-
-        # Trim and return
-        return name.strip()
+    def clean_category_name(self, name: str) -> str:
+        """Pass-through - return as-is"""
+        return name or ""
 
     def get_or_create_uom(self, unit_code: str) -> str:
         """Get or create Unit of Measure"""
@@ -197,6 +196,20 @@ class XMLItemImporter:
                 })
                 folder_doc.insert(ignore_permissions=True)
 
+            # Check if file with same name already exists for this item
+            existing_file = frappe.db.get_value(
+                "File",
+                {"file_name": filename, "attached_to_doctype": "Item", "attached_to_name": item_code},
+                "name"
+            )
+
+            if existing_file:
+                # Delete old file and replace with new content
+                old_file = frappe.get_doc("File", existing_file)
+                old_file_url = old_file.file_url
+                old_file.delete(ignore_permissions=True)
+                frappe.logger().info(f"Replaced existing image {filename} for item {item_code}")
+
             # Save file
             file_doc = save_file(
                 filename,
@@ -210,7 +223,7 @@ class XMLItemImporter:
             return file_doc.file_url
 
         except Exception as e:
-            frappe.log_error(f"Failed to download image {image_url}: {str(e)}")
+            frappe.log_error(f"Failed to download image {image_url} for item {item_code}: {str(e)}\n{traceback.format_exc()}")
             return None
 
     def map_categories(self, categories: List[Dict]) -> List[str]:
@@ -222,13 +235,11 @@ class XMLItemImporter:
             if not category_name:
                 continue
 
-            # Clean category name and remove invalid characters
-            category_name = self.clean_name(category_name)
-            category_name = category_name.replace(' > ', ' - ')
-
-            # Skip if name is empty after cleaning
+            # Skip if name is empty
             if not category_name:
-                continue            # Check if Item Group exists, create if not
+                continue
+
+            # Check if Item Group exists, create if not
             if not frappe.db.exists("Item Group", category_name):
                 try:
                     item_group = frappe.get_doc({
@@ -249,26 +260,33 @@ class XMLItemImporter:
 
     def get_or_create_item_group(self, category_name: str) -> str:
         """Get or create a single item group"""
-        if not category_name or not category_name.strip():
+        if not category_name:
             return "All Item Groups"
 
-        category_name = self.clean_name(category_name.strip())
+        # Use category name as-is without modifications
+        category_name = self.clean_category_name(category_name)
 
-        if not frappe.db.exists("Item Group", category_name):
+        # If category has hierarchy (e.g. "Parent > Child > Final"), use only the last part
+        if ">" in category_name:
+            safe_name = category_name.split(">")[-1].strip()
+        else:
+            safe_name = category_name.strip()
+
+        if not frappe.db.exists("Item Group", safe_name):
             try:
                 item_group = frappe.get_doc({
                     "doctype": "Item Group",
-                    "item_group_name": category_name,
+                    "item_group_name": safe_name,
                     "parent_item_group": "All Item Groups",
                     "is_group": 0
                 })
                 item_group.insert(ignore_permissions=True)
-                frappe.logger().info(f"Created Item Group: {category_name}")
+                frappe.logger().info(f"Created Item Group: {safe_name}")
             except Exception as e:
-                frappe.log_error(f"Failed to create Item Group {category_name}: {str(e)}")
+                frappe.log_error(f"Failed to create Item Group {safe_name}: {str(e)}")
                 return "All Item Groups"
 
-        return category_name
+        return safe_name
 
     def get_or_create_brand(self, brand_name: str) -> str:
         """Get or create a brand"""
@@ -334,13 +352,15 @@ class XMLItemImporter:
 
         try:
             # Add barcode to item's barcode table
+            # Use EAN type only if checksum is valid, otherwise no type (skip validation)
+            barcode_type = "EAN" if self.is_valid_ean_checksum(barcode_value) else ""
             item_doc.append("barcodes", {
                 "barcode": barcode_value,
-                "barcode_type": "EAN"
+                "barcode_type": barcode_type
             })
-            frappe.logger().info(f"Added EAN barcode {barcode_value} to item {item_doc.item_code}")
+            frappe.logger().info(f"Added barcode {barcode_value} (type: {barcode_type or 'none'}) to item {item_doc.item_code}")
         except Exception as e:
-            frappe.log_error(f"Failed to add barcode {barcode_value} to item {item_doc.item_code}: {str(e)}")
+            frappe.log_error(f"Failed to add barcode {barcode_value} to item {item_doc.item_code}: {str(e)}\n{traceback.format_exc()}")
 
     def is_valid_ean(self, barcode: str) -> bool:
         """Validate EAN-8, EAN-13, or other numeric barcodes"""
@@ -358,6 +378,43 @@ class XMLItemImporter:
             return False
 
         return True
+
+    def is_valid_ean_checksum(self, barcode: str) -> bool:
+        """Validate EAN/UPC check digit - returns True if checksum is valid"""
+        if not barcode or not barcode.isdigit():
+            return False
+
+        if len(barcode) not in [8, 12, 13, 14]:
+            return False
+
+        # EAN/UPC checksum algorithm
+        digits = [int(d) for d in barcode]
+        if len(barcode) in [13, 8]:
+            # EAN-13 or EAN-8
+            odd_sum = sum(digits[::2][:-1])  # odd positions (exclude check digit)
+            even_sum = sum(digits[1::2])     # even positions
+            if len(barcode) == 13:
+                total = odd_sum + even_sum * 3
+            else:  # EAN-8
+                total = odd_sum * 3 + even_sum
+            check_digit = (10 - (total % 10)) % 10
+            return check_digit == digits[-1]
+        elif len(barcode) == 12:
+            # UPC-A
+            odd_sum = sum(digits[::2][:-1])
+            even_sum = sum(digits[1::2])
+            total = odd_sum * 3 + even_sum
+            check_digit = (10 - (total % 10)) % 10
+            return check_digit == digits[-1]
+        elif len(barcode) == 14:
+            # GTIN-14
+            odd_sum = sum(digits[1::2])
+            even_sum = sum(digits[::2][:-1])
+            total = odd_sum + even_sum * 3
+            check_digit = (10 - (total % 10)) % 10
+            return check_digit == digits[-1]
+
+        return False
 
     def set_item_tax(self, item_doc, item_data: Dict[str, Any]) -> None:
         """Set item tax information using Item Tax Template"""
@@ -389,7 +446,7 @@ class XMLItemImporter:
                 item_doc.tax_amount = tax_amount
 
         except Exception as e:
-            frappe.log_error(f"Failed to set tax info for item {item_doc.item_code}: {str(e)}")
+            frappe.log_error(f"Failed to set tax info for item {item_doc.item_code}: {str(e)}\n{traceback.format_exc()}")
 
     def get_or_create_item_tax_template(self, tax_rate: float) -> str:
         """
@@ -553,9 +610,9 @@ class XMLItemImporter:
             for category in categories:
                 category_name = category.get('category_name', '').strip()
                 if category_name and category_name != default_category:
-                    # Ensure the category exists as an item group
-                    self.get_or_create_item_group(category_name)
-                    additional_categories.append(category_name)
+                    # Ensure the category exists as an item group (this also sanitizes the name)
+                    safe_category_name = self.get_or_create_item_group(category_name)
+                    additional_categories.append(safe_category_name)
 
             # Remove duplicates while preserving order
             unique_additional_categories = []
@@ -566,7 +623,7 @@ class XMLItemImporter:
                     seen.add(cat)
 
             # Store additional categories in custom field (comma-separated)
-            # This custom field needs to be created in ERPNext first
+            # Categories already have '>' replaced with '&gt;' from get_or_create_item_group
             if hasattr(item_doc, 'additional_categories'):
                 if unique_additional_categories:
                     item_doc.additional_categories = ', '.join(unique_additional_categories)
@@ -582,7 +639,7 @@ class XMLItemImporter:
                     item_doc.custom_additional_categories = ''
 
             # Also add to Website Item Groups if this is a website item
-            if item_doc.published_in_website:
+            if hasattr(item_doc, 'published_in_website') and item_doc.published_in_website:
                 # Clear existing website item groups
                 item_doc.website_item_groups = []
 
@@ -610,7 +667,7 @@ class XMLItemImporter:
                 )
 
         except Exception as e:
-            frappe.log_error(f"Failed to handle categories for item {item_doc.item_code}: {str(e)}")
+            frappe.log_error(f"Failed to handle categories for item {item_doc.item_code}: {str(e)}\n{traceback.format_exc()}")
 
     def ensure_additional_categories_field(self) -> None:
         """
@@ -885,13 +942,139 @@ class XMLItemImporter:
         element = parent.find(tag_name)
         return element.text.strip() if element is not None and element.text else ""
 
+    def normalize_item_data(self, item_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize item data field names from various SAX parser formats.
+        Maps old field names to expected field names for consistency.
+        """
+        # Field mapping: old_name -> new_name
+        field_mappings = {
+            # Basic fields
+            'item_id': 'external_id',
+            'product_name': 'item_name',
+            'name': 'item_name',
+            # Pricing
+            'price_vat': 'selling_price_with_tax',
+            'price': 'selling_price_with_tax',
+            'vat_rate': 'tax_rate',
+            # Product details
+            'manufacturer': 'manufacturer_name',
+            'ean': 'barcode',
+            'unit': 'unit_of_measure',
+            'weight': 'weight_kg',
+            'currency': 'currency_code',
+            # Stock
+            'stock_quantity': 'current_stock',
+            'stock_amount': 'current_stock',
+            # Categories - handle list conversion
+            'categories': 'product_categories',
+            # Images - handle list conversion
+            'images': 'product_images',
+        }
+
+        normalized = item_data.copy()
+
+        # FIRST: Get item_name from the top-level NAME tag (stored in item_name or additional_data.name)
+        # This takes priority over other name fields like product_name
+        additional = normalized.get('additional_data', {})
+        top_level_name = normalized.get('item_name') or additional.get('name')
+
+        # Apply field mappings (only if target doesn't exist or is empty)
+        for old_key, new_key in field_mappings.items():
+            if old_key in normalized and new_key not in normalized:
+                normalized[new_key] = normalized[old_key]
+            elif old_key in normalized and not normalized.get(new_key):
+                normalized[new_key] = normalized[old_key]
+
+        # ALWAYS use the top-level NAME if available (overrides product_name mapping)
+        if top_level_name:
+            normalized['item_name'] = top_level_name
+
+        # Handle default_category from additional_data or direct field
+        if not normalized.get('default_category'):
+            if additional.get('default_category'):
+                normalized['default_category'] = additional['default_category']
+
+        # Normalize categories list format
+        if 'product_categories' in normalized:
+            cats = normalized['product_categories']
+            if cats and isinstance(cats, list):
+                # Convert old format [{category_id, category_name}] to new format
+                normalized_cats = []
+                for cat in cats:
+                    if isinstance(cat, dict):
+                        normalized_cats.append({
+                            'category_id': cat.get('category_id', cat.get('id', '')),
+                            'category_name': cat.get('category_name', cat.get('name', ''))
+                        })
+                    elif isinstance(cat, str):
+                        normalized_cats.append({'category_id': '', 'category_name': cat})
+                normalized['product_categories'] = normalized_cats
+
+        # Normalize images list format
+        if 'product_images' in normalized:
+            imgs = normalized['product_images']
+            if imgs and isinstance(imgs, list):
+                normalized_imgs = []
+                for img in imgs:
+                    if isinstance(img, dict):
+                        normalized_imgs.append({
+                            'image_url': img.get('image_url', img.get('url', '')),
+                            'image_description': img.get('image_description', img.get('description', ''))
+                        })
+                    elif isinstance(img, str):
+                        normalized_imgs.append({'image_url': img, 'image_description': ''})
+                normalized['product_images'] = normalized_imgs
+
+        # Extract wholesale_price from pricelists array
+        pricelists = normalized.get('pricelists', [])
+        for pl in pricelists:
+            if isinstance(pl, dict):
+                title = pl.get('title', '')
+                # Match "Veľkoobchod" exactly (no string modifications)
+                if title == 'Veľkoobchod':
+                    try:
+                        normalized['wholesale_price'] = float(pl.get('price_vat', 0))
+                    except (ValueError, TypeError):
+                        pass
+
+        return normalized
+
     def create_or_update_item(self, item_data: Dict[str, Any]) -> bool:
         """Create or update ERPNext Item"""
         try:
+            # Normalize field names from various SAX parser formats
+            item_data = self.normalize_item_data(item_data)
+
+            # Debug: Log what we received
+            item_id = item_data.get('item_code') or item_data.get('external_id') or 'Unknown'
+            frappe.logger().debug(f"Processing item {item_id}: item_name='{item_data.get('item_name')}', default_category='{item_data.get('default_category')}'")
+
+            # Validate and clean input data
             item_code = item_data.get('item_code')
-            if not item_code:
-                self.add_error(f"Missing item code for XML ID: {item_data.get('xml_id')}")
-                return False
+            if not item_code or not item_code.strip():
+                # Try fallback to external_id
+                item_code = item_data.get('external_id')
+                if not item_code:
+                    error_msg = f"Missing item code for item with external_id: {item_data.get('external_id', 'Unknown')}"
+                    self.add_error(error_msg)
+                    frappe.logger().warning(f"{error_msg}. Available fields: {list(item_data.keys())}")
+                    return False
+                else:
+                    item_data['item_code'] = item_code
+
+            # Clean item code - remove any problematic characters
+            item_code = str(item_code).strip()
+
+            # Validate item name
+            item_name = item_data.get('item_name')
+            if not item_name or not item_name.strip():
+                # Use item_code as fallback
+                item_name = item_code
+                frappe.logger().info(f"Using item_code as item_name for {item_code}")
+
+            # Clean item name
+            item_name = self.clean_name(str(item_name)) or item_code
 
             # Check if item exists
             existing_item = None
@@ -904,7 +1087,7 @@ class XMLItemImporter:
 
             # Map basic fields - clean the names
             existing_item.item_code = item_code
-            existing_item.item_name = self.clean_name(item_data.get('item_name', item_code)) or item_code
+            existing_item.item_name = item_name
 
             # Set main description from DESCRIPTION tag
             if item_data.get('description'):
@@ -920,26 +1103,49 @@ class XMLItemImporter:
             # Set primary item group - prioritize DEFAULT_CATEGORY
             default_category = item_data.get('default_category')
 
-            if default_category:
-                # Use DEFAULT_CATEGORY as the primary item group
-                existing_item.item_group = self.get_or_create_item_group(default_category)
-            else:
-                # Fall back to first category or default
-                item_groups = self.map_categories(item_data.get('product_categories', []))
-                if item_groups:
-                    existing_item.item_group = item_groups[0]
+            try:
+                if default_category:
+                    # Use DEFAULT_CATEGORY as the primary item group (no string modifications)
+                    existing_item.item_group = self.get_or_create_item_group(default_category)
+                    frappe.logger().debug(f"Set item group from default_category: {default_category}")
                 else:
-                    existing_item.item_group = "All Item Groups"
+                    # Fall back to first category or default
+                    item_groups = self.map_categories(item_data.get('product_categories', []))
+                    if item_groups:
+                        existing_item.item_group = item_groups[0]
+                        frappe.logger().debug(f"Set item group from first category: {item_groups[0]}")
+                    else:
+                        existing_item.item_group = "All Item Groups"
+                        frappe.logger().debug(f"Using default item group: All Item Groups")
+            except Exception as e:
+                frappe.logger().error(f"Error setting item group for {item_code}: {str(e)}")
+                existing_item.item_group = "All Item Groups"
 
             # Handle multiple categories (1:N relationship)
-            self.handle_item_categories(existing_item, item_data.get('product_categories', []), default_category)
+            try:
+                self.handle_item_categories(existing_item, item_data.get('product_categories', []), default_category)
+            except Exception as e:
+                frappe.logger().error(f"Error handling categories for {item_code}: {str(e)}")
 
             # Set basic properties - use proper UOM
-            existing_item.stock_uom = self.get_or_create_uom(item_data.get('unit_of_measure', 'Nos'))
+            uom = self.get_or_create_uom(item_data.get('unit_of_measure', 'Nos'))
+            existing_item.stock_uom = uom
             existing_item.is_stock_item = 1
             existing_item.include_item_in_manufacturing = 0
             existing_item.is_sales_item = 1
             existing_item.is_purchase_item = 1
+
+            # Ensure no duplicate UOM conversions - keep only one per UOM
+            existing_uoms = {}
+            for u in getattr(existing_item, 'uoms', []):
+                existing_uoms[u.uom] = u
+            existing_item.uoms = list(existing_uoms.values())
+
+            # Ensure no duplicate Item Defaults - keep only one per company
+            existing_defaults = {}
+            for d in getattr(existing_item, 'item_defaults', []):
+                existing_defaults[d.company] = d
+            existing_item.item_defaults = list(existing_defaults.values())
 
             # Set brand (from manufacturer field in XML)
             brand_name = self.clean_name(item_data.get('manufacturer_name', ''))
@@ -993,7 +1199,8 @@ class XMLItemImporter:
             # Handle barcode (EAN type) - update if changed
             new_barcode = item_data.get('barcode')
             if new_barcode:
-                new_barcode = new_barcode.strip()
+                # Clean barcode - remove spaces and dashes
+                new_barcode = new_barcode.strip().replace(" ", "").replace("-", "")
                 # Validate EAN code (must be numeric and correct length)
                 if self.is_valid_ean(new_barcode):
                     # Get all existing barcodes for this item
@@ -1003,15 +1210,17 @@ class XMLItemImporter:
                         existing_item.barcodes = []
                         # Only add if not used by another item
                         if not frappe.db.get_value("Item Barcode", {"barcode": new_barcode}):
+                            # Use EAN type only if checksum is valid, otherwise no type (skip validation)
+                            barcode_type = "EAN" if self.is_valid_ean_checksum(new_barcode) else ""
                             existing_item.append("barcodes", {
                                 "barcode": new_barcode,
-                                "barcode_type": "EAN"
+                                "barcode_type": barcode_type
                             })
-                            frappe.logger().info(f"Updated EAN barcode to {new_barcode} for item {item_code}")
+                            frappe.logger().info(f"Updated barcode to {new_barcode} (type: {barcode_type or 'none'}) for item {item_code}")
                         else:
                             frappe.logger().info(f"Barcode {new_barcode} already exists for another item, not updating {item_code}")
                 else:
-                    frappe.logger().warning(f"Invalid EAN barcode '{new_barcode}' for item {item_code}, skipping")
+                    frappe.logger().warning(f"Invalid barcode '{new_barcode}' for item {item_code}, skipping")
 
             # Handle tax information
             if item_data.get('tax_rate'):
@@ -1030,25 +1239,47 @@ class XMLItemImporter:
             # Handle images
             if item_data.get('product_images'):
                 self.handle_item_images(existing_item, item_data.get('product_images', []))
+            elif item_data.get('image_url'):
+                # Handle single image URL (legacy format)
+                self.handle_item_images(existing_item, [{'image_url': item_data.get('image_url')}])
 
             # Create/update item price
             self.create_item_price(existing_item, item_data)
 
-            # Update stock levels
-            if item_data.get('current_stock') is not None:
-                self.update_stock_levels(existing_item, item_data)
+            # Update stock levels - handle both string and numeric values
+            stock_qty = item_data.get('current_stock')
+            if stock_qty is not None and stock_qty != '':
+                try:
+                    stock_qty_float = flt(stock_qty)
+                    if stock_qty_float >= 0:
+                        self.update_stock_levels(existing_item, {'current_stock': stock_qty_float, 'purchase_price': item_data.get('purchase_price', 0)})
+                except (ValueError, TypeError):
+                    frappe.logger().warning(f"Invalid stock quantity '{stock_qty}' for item {item_code}")
 
             frappe.db.commit()
             return True
 
         except Exception as e:
             frappe.db.rollback()
-            error_msg = f"Failed to process item {item_data.get('item_code', 'Unknown')}: {str(e)}"
-            self.add_error(error_msg)
-            frappe.log_error(error_msg)
-            frappe.logger().error(f"Item import error: {error_msg}")
-            import traceback
-            frappe.logger().error(traceback.format_exc())
+            item_identifier = item_data.get('item_code') or item_data.get('external_id') or 'Unknown'
+            error_msg = f"Failed to process item {item_identifier}: {str(e)}"
+
+            # Add detailed error information
+            error_details = {
+                "item_identifier": item_identifier,
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "item_data_keys": list(item_data.keys()) if item_data else [],
+                "item_name": item_data.get('item_name', 'Not set'),
+                "default_category": item_data.get('default_category', 'Not set'),
+                "categories_count": len(item_data.get('product_categories', [])),
+            }
+
+            detailed_error_msg = f"{error_msg}\nDetails: {json.dumps(error_details, indent=2)}"
+            self.add_error(detailed_error_msg)
+            frappe.log_error(detailed_error_msg, "XML Item Import Error")
+            frappe.logger().error(f"Item import error: {detailed_error_msg}")
+            frappe.logger().error(f"Full traceback: {traceback.format_exc()}")
             return False
 
     def handle_item_images(self, item_doc: Document, images: List[Dict]) -> None:
@@ -1064,27 +1295,19 @@ class XMLItemImporter:
             if not image_url:
                 return
 
-            # Check if image already attached
-            existing_file = frappe.db.get_value(
-                "File",
-                {"file_url": image_url, "attached_to_doctype": "Item", "attached_to_name": item_doc.name},
-                "name"
+            # Download and attach image (will replace if exists)
+            local_image_url = self.download_image(
+                image_url,
+                item_doc.item_code,
+                first_image.get('image_description', '')
             )
 
-            if not existing_file:
-                # Download and attach image
-                image_url = self.download_image(
-                    image_url,
-                    item_doc.item_code,
-                    first_image.get('image_description', '')
-                )
-
-            if image_url:
-                item_doc.image = image_url
+            if local_image_url:
+                item_doc.image = local_image_url
                 item_doc.save(ignore_permissions=True)
 
         except Exception as e:
-            frappe.log_error(f"Failed to handle images for item {item_doc.item_code}: {str(e)}")
+            frappe.log_error(f"Failed to handle images for item {item_doc.item_code}: {str(e)}\n{traceback.format_exc()}")
 
     def create_item_price(self, item_doc: Document, item_data: Dict[str, Any]) -> None:
         """Create or update item prices for both retail and wholesale"""
@@ -1111,7 +1334,7 @@ class XMLItemImporter:
                 self.create_or_update_price("Standard Buying", item_doc.item_code, purchase_price, currency)
 
         except Exception as e:
-            frappe.log_error(f"Failed to create item prices for {item_doc.item_code}: {str(e)}")
+            frappe.log_error(f"Failed to create item prices for {item_doc.item_code}: {str(e)}\n{traceback.format_exc()}")
 
     def create_or_update_price(self, price_list: str, item_code: str, price: float, currency: str) -> None:
         """Create or update a single item price"""
@@ -1138,7 +1361,7 @@ class XMLItemImporter:
             frappe.logger().info(f"Set {price_list} price for {item_code}: {price} {currency}")
 
         except Exception as e:
-            frappe.log_error(f"Failed to create/update {price_list} price for {item_code}: {str(e)}")
+            frappe.log_error(f"Failed to create/update {price_list} price for {item_code}: {str(e)}\n{traceback.format_exc()}")
 
     def ensure_price_list_exists(self, price_list_name: str, currency: str, selling: bool = True) -> None:
         """Ensure price list exists"""
@@ -1195,7 +1418,7 @@ class XMLItemImporter:
                 stock_entry.submit()
 
         except Exception as e:
-            frappe.log_error(f"Failed to update stock for {item_doc.item_code}: {str(e)}")
+            frappe.log_error(f"Failed to update stock for {item_doc.item_code}: {str(e)}\n{traceback.format_exc()}")
 
     def add_error(self, error_msg: str) -> None:
         """Add error to error list"""
@@ -1360,7 +1583,10 @@ class XMLItemImporter:
 @frappe.whitelist()
 def import_xml_items(xml_source: str, company: str = None) -> Dict[str, Any]:
     """
-    Import items from XML feed
+    Import items from XML feed using SAX parser with Redis queue
+
+    This function now always uses the memory-optimized SAX parser with Redis queue
+    instead of the DOM-based ElementTree parser.
 
     Args:
         xml_source: URL or file path to XML feed
@@ -1369,11 +1595,8 @@ def import_xml_items(xml_source: str, company: str = None) -> Dict[str, Any]:
     Returns:
         Dict with import results
     """
-    # Set timeout to 1 hour for manual XML imports
-    frappe.local.request_timeout = 3600
-
-    importer = XMLItemImporter(xml_source, company)
-    return importer.import_from_xml()
+    # Always use SAX parser with Redis queue for memory efficiency
+    return import_xml_items_sax(xml_source, company, use_queue=True)
 
 
 def scheduled_xml_import():
@@ -1519,14 +1742,1007 @@ def send_import_notification(result: Dict[str, Any], recipients: str):
             Time: {now()}
             """
 
-        if result.get('error_messages'):
-            message += f"\n\nFirst few errors:\n" + "\n".join(result['error_messages'])
-
         frappe.sendmail(
-            recipients=recipients_list,
+            recipients=recipients,
             subject=subject,
             message=message
         )
 
     except Exception as e:
-        frappe.log_error(f"Failed to send import notification: {str(e)}")
+        frappe.log_error(f"Failed to send import notification email: {str(e)}")
+
+
+# ================================
+# SAX PARSER CLASSES FOR MEMORY OPTIMIZATION
+# ================================
+
+class SAXItemHandler(xml.sax.ContentHandler):
+    """
+    SAX Content Handler for parsing XML items and queuing them in Redis
+    Memory-efficient streaming XML parser that extracts individual SHOPITEM elements
+    """
+
+    # Redis key for storing import progress
+    PROGRESS_KEY = "xml_import_progress"
+
+    def __init__(self, redis_client=None, queue_name: str = None):
+        """Initialize SAX handler for Redis queue processing only"""
+        super().__init__()
+        self.redis_client = redis_client
+        self.queue_name = queue_name
+
+        # Parser state
+        self.current_element = None
+        self.current_data = ""
+        self.current_item = {}
+        self.element_stack = []
+        self.in_shopitem = False
+        self.in_categories = False
+        self.in_images = False
+        self.in_variants = False
+        self.in_variant = False
+        self.in_pricelists = False
+        self.in_pricelist = False
+        self.in_parameters = False
+        self.current_category = {}
+        self.current_image = {}
+        self.current_supplier = {}
+        self.current_variant = {}
+        self.current_pricelist = {}
+        self.current_parameter = {}
+
+        # Counters
+        self.items_queued = 0
+        self.items_processed = 0
+        self.parse_errors = 0
+
+        # Progress tracking
+        self.last_progress_update = datetime.now()
+
+        # Initialize progress in Redis
+        if self.redis_client:
+            self._init_progress()
+
+    def _init_progress(self):
+        """Initialize progress tracking in Redis"""
+        progress_data = {
+            "phase": "parsing",
+            "queue_name": self.queue_name,
+            "total_items": 0,
+            "processed": 0,
+            "errors": 0,
+            "start_time": datetime.now().isoformat(),
+            "last_update": datetime.now().isoformat(),
+            "status": "running"
+        }
+        self.redis_client.set(self.PROGRESS_KEY, json.dumps(progress_data))
+        # Set expiry of 1 hour
+        self.redis_client.expire(self.PROGRESS_KEY, 3600)
+
+    def _update_redis_progress(self, phase: str = "parsing", processed: int = 0, errors: int = 0):
+        """Update progress in Redis"""
+        if not self.redis_client:
+            return
+        try:
+            progress_data = {
+                "phase": phase,
+                "queue_name": self.queue_name,
+                "total_items": self.items_queued,
+                "processed": processed,
+                "errors": errors,
+                "start_time": None,  # Keep existing
+                "last_update": datetime.now().isoformat(),
+                "status": "running"
+            }
+            # Get existing start_time
+            existing = self.redis_client.get(self.PROGRESS_KEY)
+            if existing:
+                existing_data = json.loads(existing)
+                progress_data["start_time"] = existing_data.get("start_time")
+            self.redis_client.set(self.PROGRESS_KEY, json.dumps(progress_data))
+        except Exception as e:
+            frappe.log_error(f"Failed to update progress: {str(e)}")
+
+    def startElement(self, name: str, attrs):
+        """Handle start of XML element"""
+        self.element_stack.append(name)
+        self.current_element = name
+        self.current_data = ""
+
+        if name == "SHOPITEM":
+            self.in_shopitem = True
+            self.in_pricelists = False
+            self.in_pricelist = False
+            self.in_variants = False
+            self.in_variant = False
+            self.in_parameters = False
+            self.current_pricelist = {}
+            self.current_variant = {}
+            self.current_parameter = {}
+            self.current_item = {
+                "item_id": attrs.get("id", ""),
+                "categories": [],
+                "images": [],
+                "pricelists": [],
+                "variants": [],
+                "additional_data": {}
+            }
+
+        elif self.in_shopitem:
+            if name == "CATEGORIES":
+                self.in_categories = True
+            elif name == "CATEGORY" and self.in_categories:
+                self.current_category = {
+                    "category_id": attrs.get("id", ""),
+                    "category_name": ""
+                }
+            elif name == "DEFAULT_CATEGORY" and self.in_categories:
+                self.current_item["default_category_id"] = attrs.get("id", "")
+            elif name == "IMAGES":
+                self.in_images = True
+            elif name == "IMAGE" and self.in_images:
+                self.current_image = {
+                    "url": "",
+                    "description": attrs.get("description", "")
+                }
+            elif name == "CATEGORYTEXT":
+                self.current_category = {
+                    "category_id": attrs.get("id", ""),
+                    "category_name": ""
+                }
+            elif name == "VARIANTS":
+                self.in_variants = True
+            elif name == "VARIANT" and self.in_variants:
+                self.in_variant = True
+                self.current_variant = {
+                    "variant_id": attrs.get("id", ""),
+                    "pricelists": [],
+                    "parameters": []
+                }
+            elif name == "PRICELISTS":
+                self.in_pricelists = True
+            elif name == "PRICELIST" and self.in_pricelists:
+                self.in_pricelist = True
+                self.current_pricelist = {
+                    "title": "",
+                    "price_vat": ""
+                }
+            elif name == "PARAMETERS" and self.in_variant:
+                self.in_parameters = True
+            elif name == "PARAMETER" and self.in_parameters:
+                self.current_parameter = {"name": "", "value": ""}
+
+    def characters(self, content: str):
+        """Handle character data between XML tags"""
+        # Accumulate raw content as-is, no stripping
+        self.current_data += content
+
+    def endElement(self, name: str):
+        """Handle end of XML element"""
+        # Use data as-is, no stripping
+        data = self.current_data
+        if name == "SHOPITEM" and self.in_shopitem:
+            # Check if item has variants
+            variants = self.current_item.get("variants", [])
+
+            if variants:
+                # Has variants - queue each variant as a separate item
+                base_item = self.current_item.copy()
+                for variant in variants:
+                    # Create item from variant, inheriting base item properties
+                    variant_item = {
+                        "item_id": variant.get("variant_id", ""),
+                        "item_code": variant.get("code", ""),  # Variant CODE is the item_code
+                        "item_name": base_item.get("item_name", ""),
+                        "description": base_item.get("description", ""),
+                        "short_description": base_item.get("short_description", ""),
+                        "manufacturer": base_item.get("manufacturer", ""),
+                        "supplier_name": base_item.get("supplier_name", ""),
+                        "categories": base_item.get("categories", []),
+                        "default_category": base_item.get("default_category", ""),
+                        "images": [],  # Will use variant IMAGE_REF
+                        "ean": variant.get("ean", ""),
+                        "price_vat": variant.get("price_vat", ""),
+                        "purchase_price": variant.get("purchase_price", ""),
+                        "vat_rate": variant.get("vat", ""),
+                        "currency": variant.get("currency", ""),
+                        "unit": variant.get("unit", ""),
+                        "weight": variant.get("weight", ""),
+                        "stock_quantity": variant.get("stock_amount", ""),
+                        "pricelists": variant.get("pricelists", []),
+                        "parameters": variant.get("parameters", []),
+                        "additional_data": base_item.get("additional_data", {}).copy()
+                    }
+
+                    # Use variant IMAGE_REF as the image
+                    if variant.get("image_ref"):
+                        variant_item["images"] = [{"url": variant["image_ref"], "description": ""}]
+
+                    # Queue variant as separate item
+                    if self.redis_client and self.queue_name:
+                        self.queue_item(variant_item)
+                    self.items_queued += 1
+            else:
+                # No variants - use top-level CODE if available
+                if not self.current_item.get("item_code") or not self.current_item.get("item_code").strip():
+                    self.current_item["item_code"] = self.current_item.get("item_id", "")
+
+                # Complete item parsed - queue it in Redis
+                if self.redis_client and self.queue_name:
+                    self.queue_item(self.current_item)
+                self.items_queued += 1
+
+            self.current_item = {}
+            self.in_shopitem = False
+            self.in_categories = False
+            self.in_images = False
+            self.in_variants = False
+            self.in_variant = False
+
+            # Update progress periodically
+            self.update_progress()
+
+        elif self.in_shopitem:
+            # Handle structure closings
+            if name == "CATEGORIES":
+                self.in_categories = False
+            elif name == "IMAGES":
+                self.in_images = False
+            elif name == "VARIANTS":
+                self.in_variants = False
+            elif name == "VARIANT" and self.in_variant:
+                # Complete variant - add to variants list
+                self.current_item["variants"].append(self.current_variant.copy())
+                self.current_variant = {}
+                self.in_variant = False
+            elif name == "PARAMETERS" and self.in_variant:
+                self.in_parameters = False
+            elif name == "PARAMETER" and self.in_parameters:
+                if self.current_parameter.get("name") or self.current_parameter.get("value"):
+                    self.current_variant["parameters"].append(self.current_parameter.copy())
+                self.current_parameter = {}
+            elif name == "PRICELISTS":
+                self.in_pricelists = False
+            elif name == "PRICELIST" and self.in_pricelists:
+                self.in_pricelist = False
+                if self.current_pricelist.get("title") and self.current_pricelist.get("price_vat"):
+                    # Add pricelist to variant if inside variant, otherwise to item
+                    if self.in_variant:
+                        self.current_variant["pricelists"].append(self.current_pricelist.copy())
+                    else:
+                        self.current_item["pricelists"].append(self.current_pricelist.copy())
+                self.current_pricelist = {}
+            # Handle TITLE inside PRICELIST
+            elif name == "TITLE" and self.in_pricelist:
+                self.current_pricelist["title"] = data
+            # Handle PRICE_VAT - context-aware (variant vs top-level vs pricelist)
+            elif name == "PRICE_VAT":
+                if self.in_pricelist:
+                    self.current_pricelist["price_vat"] = data
+                elif self.in_variant:
+                    self.current_variant["price_vat"] = data
+                else:
+                    self.current_item["price_vat"] = data
+            # Handle NAME element - only at top level under SHOPITEM (depth 3: SHOP > SHOPITEM > NAME)
+            # Also handle NAME inside PARAMETER
+            elif name == "NAME":
+                if self.in_parameters and self.current_parameter is not None:
+                    self.current_parameter["name"] = data
+                elif len(self.element_stack) == 3:
+                    self.current_item["item_name"] = data
+                    self.current_item["additional_data"]["name"] = data
+            # Handle VALUE inside PARAMETER
+            elif name == "VALUE" and self.in_parameters:
+                self.current_parameter["value"] = data
+            # Handle various item fields
+            elif name == "PRODUCT":
+                self.current_item["product_name"] = data
+            elif name == "PRODUCTNAME":
+                self.current_item["product_name"] = data
+            # Handle DESCRIPTION - only at top level under SHOPITEM (depth 3)
+            elif name == "DESCRIPTION" and len(self.element_stack) == 3:
+                self.current_item["description"] = data
+            elif name == "SHORT_DESCRIPTION":
+                self.current_item["short_description"] = data
+            elif name == "URL":
+                self.current_item["url"] = data
+            elif name == "IMGURL":
+                self.current_item["image_url"] = data
+            elif name == "PRICE":
+                if self.in_variant:
+                    self.current_variant["price"] = data
+                else:
+                    self.current_item["price"] = data
+            elif name == "VAT":
+                if self.in_variant:
+                    self.current_variant["vat"] = data
+                else:
+                    self.current_item["vat_rate"] = data
+            elif name == "PURCHASE_PRICE":
+                if self.in_variant:
+                    self.current_variant["purchase_price"] = data
+                else:
+                    self.current_item["purchase_price"] = data
+            elif name == "MANUFACTURER":
+                self.current_item["manufacturer"] = data
+            elif name == "EAN":
+                if self.in_variant:
+                    self.current_variant["ean"] = data
+                else:
+                    self.current_item["ean"] = data
+            elif name == "CODE":
+                if self.in_variant:
+                    self.current_variant["code"] = data
+                elif len(self.element_stack) == 3:  # Only top-level CODE
+                    self.current_item["item_code"] = data
+            elif name == "PRODUCTNO":
+                self.current_item["product_code"] = data
+            elif name == "AVAILABILITY":
+                self.current_item["availability"] = data
+            elif name == "STOCK_QUANTITY":
+                self.current_item["stock_quantity"] = data
+            elif name == "AMOUNT":
+                # Stock amount inside STOCK tag
+                if self.in_variant:
+                    self.current_variant["stock_amount"] = data
+                else:
+                    self.current_item["stock_quantity"] = data
+            elif name == "UNIT":
+                if self.in_variant:
+                    self.current_variant["unit"] = data
+                else:
+                    self.current_item["unit"] = data
+            elif name == "WEIGHT":
+                if self.in_variant:
+                    self.current_variant["weight"] = data
+                else:
+                    self.current_item["weight"] = data
+            elif name == "CURRENCY":
+                if self.in_variant:
+                    self.current_variant["currency"] = data
+                else:
+                    self.current_item["currency"] = data
+            elif name == "IMAGE_REF" and self.in_variant:
+                self.current_variant["image_ref"] = data
+            # Handle CATEGORY inside CATEGORIES
+            elif name == "CATEGORY" and self.in_categories:
+                self.current_category["category_name"] = data
+                self.current_item["categories"].append(self.current_category.copy())
+                self.current_category = {}
+            # Handle DEFAULT_CATEGORY - only inside CATEGORIES (depth 4: SHOP > SHOPITEM > CATEGORIES > DEFAULT_CATEGORY)
+            elif name == "DEFAULT_CATEGORY" and self.in_categories and len(self.element_stack) == 4:
+                self.current_item["default_category"] = data
+                self.current_item["additional_data"]["default_category"] = data
+            # Legacy CATEGORYTEXT support
+            elif name == "CATEGORYTEXT":
+                self.current_category["category_name"] = data
+                self.current_item["categories"].append(self.current_category.copy())
+                self.current_category = {}
+            # Handle IMAGE inside IMAGES - URL is the content
+            elif name == "IMAGE" and self.in_images:
+                if data:
+                    self.current_image["url"] = data
+                self.current_item["images"].append(self.current_image.copy())
+                self.current_image = {}
+            # Legacy IMAGE support (with url attribute)
+            elif name == "IMAGE" and not self.in_images:
+                if data:
+                    self.current_image["description"] = data
+                self.current_item["images"].append(self.current_image.copy())
+                self.current_image = {}
+            elif name == "SUPPLIER":
+                # Single supplier value (not array)
+                self.current_item["supplier_name"] = data
+            else:
+                # Store any other data in additional_data
+                if data and not self.in_variant:
+                    self.current_item["additional_data"][name.lower()] = data
+
+        # Pop from stack
+        if self.element_stack:
+            self.element_stack.pop()
+
+        # Reset current data
+        self.current_data = ""
+        self.current_element = self.element_stack[-1] if self.element_stack else None
+
+    def queue_item(self, item_data: Dict[str, Any]):
+        """Queue item for background processing"""
+        try:
+            if not REDIS_AVAILABLE:
+                return
+
+            # Generate unique ID for this queue entry
+            queue_id = str(uuid.uuid4())
+
+            # Add metadata
+            queue_entry = {
+                "id": queue_id,
+                "timestamp": datetime.now().isoformat(),
+                "item_data": item_data,
+                "status": "queued"
+            }
+
+            # Push to Redis queue
+            self.redis_client.lpush(
+                self.queue_name,
+                json.dumps(queue_entry, ensure_ascii=False)
+            )
+
+        except Exception as e:
+            frappe.log_error(f"Failed to queue item: {str(e)}")
+            self.parse_errors += 1
+
+    def update_progress(self):
+        """Update progress in realtime for UI feedback"""
+        now = datetime.now()
+        if (now - self.last_progress_update).seconds >= 2:  # Update every 2 seconds
+            frappe.publish_realtime(
+                "sax_parse_progress",
+                {
+                    "items_queued": self.items_queued,
+                    "items_processed": self.items_processed,
+                    "parse_errors": self.parse_errors,
+                    "message": f"Parsed {self.items_queued} items, processed {self.items_processed}"
+                },
+                user=frappe.session.user
+            )
+            # Also update Redis progress
+            self._update_redis_progress("parsing")
+            self.last_progress_update = now
+
+    def finalize_parsing(self):
+        """Called when SAX parsing is complete - update total in Redis"""
+        if self.redis_client:
+            self._update_redis_progress("queued")
+            frappe.logger().info(f"SAX parsing complete: {self.items_queued} items queued")
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get parsing statistics"""
+        return {
+            "items_queued": self.items_queued,
+            "items_processed": self.items_processed,
+            "parse_errors": self.parse_errors
+        }
+
+
+def get_redis_client():
+    """Get Redis client connection"""
+    if not REDIS_AVAILABLE:
+        frappe.throw("Redis package not installed. Install with: pip install redis")
+
+    try:
+        # Get Redis configuration from Frappe
+        redis_config = frappe.conf.get("redis_queue") or frappe.conf.get("redis_cache")
+
+        if isinstance(redis_config, str):
+            return redis.from_url(redis_config)
+        elif isinstance(redis_config, dict):
+            return redis.Redis(**redis_config)
+        else:
+            return redis.Redis(host='localhost', port=6379, db=0)
+
+    except Exception as e:
+        frappe.log_error(f"Redis connection error: {str(e)}")
+        return redis.Redis(host='localhost', port=6379, db=0)
+
+
+# Progress tracking key
+IMPORT_PROGRESS_KEY = "xml_import_progress"
+
+
+def _update_import_progress(redis_client, phase: str, total: int, processed: int,
+                           errors: int, queue_name: str, completed: bool = False):
+    """Update import progress in Redis"""
+    try:
+        # Get existing data to preserve start_time
+        existing = redis_client.get(IMPORT_PROGRESS_KEY)
+        start_time = datetime.now().isoformat()
+        if existing:
+            existing_data = json.loads(existing)
+            start_time = existing_data.get("start_time", start_time)
+
+        progress_data = {
+            "phase": phase,
+            "queue_name": queue_name,
+            "total_items": total,
+            "processed": processed,
+            "errors": errors,
+            "start_time": start_time,
+            "last_update": datetime.now().isoformat(),
+            "status": "complete" if completed else "running"
+        }
+        redis_client.set(IMPORT_PROGRESS_KEY, json.dumps(progress_data))
+        # Set expiry - shorter if completed
+        redis_client.expire(IMPORT_PROGRESS_KEY, 300 if completed else 3600)
+    except Exception as e:
+        frappe.log_error(f"Failed to update import progress: {str(e)}")
+
+
+@frappe.whitelist()
+def get_import_progress() -> Dict[str, Any]:
+    """
+    Get current import progress from Redis
+
+    Returns:
+        Dict with progress information or empty status if no import running
+    """
+    try:
+        if not REDIS_AVAILABLE:
+            return {"status": "no_redis", "message": "Redis not available"}
+
+        redis_client = get_redis_client()
+        progress_data = redis_client.get(IMPORT_PROGRESS_KEY)
+
+        if not progress_data:
+            return {
+                "status": "idle",
+                "message": "No import in progress",
+                "is_running": False
+            }
+
+        data = json.loads(progress_data)
+
+        # Calculate percentage
+        total = data.get("total_items", 0)
+        processed = data.get("processed", 0)
+        percentage = round((processed / total * 100), 1) if total > 0 else 0
+
+        # Calculate elapsed time
+        start_time = data.get("start_time")
+        elapsed_seconds = 0
+        if start_time:
+            try:
+                start_dt = datetime.fromisoformat(start_time)
+                elapsed_seconds = (datetime.now() - start_dt).total_seconds()
+            except:
+                pass
+
+        # Format elapsed time
+        elapsed_str = ""
+        if elapsed_seconds > 0:
+            minutes = int(elapsed_seconds // 60)
+            seconds = int(elapsed_seconds % 60)
+            elapsed_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+        # Estimate remaining time
+        remaining_str = ""
+        if processed > 0 and total > processed:
+            rate = processed / elapsed_seconds if elapsed_seconds > 0 else 0
+            if rate > 0:
+                remaining_seconds = (total - processed) / rate
+                remaining_minutes = int(remaining_seconds // 60)
+                remaining_secs = int(remaining_seconds % 60)
+                remaining_str = f"{remaining_minutes}m {remaining_secs}s" if remaining_minutes > 0 else f"{remaining_secs}s"
+
+        return {
+            "status": data.get("status", "unknown"),
+            "phase": data.get("phase", "unknown"),
+            "is_running": data.get("status") == "running",
+            "total_items": total,
+            "processed": processed,
+            "errors": data.get("errors", 0),
+            "percentage": percentage,
+            "elapsed_time": elapsed_str,
+            "remaining_time": remaining_str,
+            "queue_name": data.get("queue_name", ""),
+            "last_update": data.get("last_update", ""),
+            "message": f"Processing {processed}/{total} items ({percentage}%)"
+        }
+
+    except Exception as e:
+        frappe.log_error(f"Error getting import progress: {str(e)}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "is_running": False
+        }
+
+
+@frappe.whitelist()
+def cancel_import() -> Dict[str, Any]:
+    """
+    Cancel the current import and clean up Redis
+
+    Returns:
+        Dict with cancellation result
+    """
+    try:
+        if not REDIS_AVAILABLE:
+            return {"success": False, "message": "Redis not available"}
+
+        redis_client = get_redis_client()
+
+        # Get current progress to find queue name
+        progress_data = redis_client.get(IMPORT_PROGRESS_KEY)
+        queue_name = None
+
+        if progress_data:
+            data = json.loads(progress_data)
+            queue_name = data.get("queue_name")
+
+            # Mark as cancelled
+            data["status"] = "cancelled"
+            data["last_update"] = datetime.now().isoformat()
+            redis_client.set(IMPORT_PROGRESS_KEY, json.dumps(data))
+            redis_client.expire(IMPORT_PROGRESS_KEY, 60)  # Keep for 1 minute only
+
+        # Clean up the queue if it exists
+        items_removed = 0
+        if queue_name:
+            items_removed = redis_client.llen(queue_name)
+            redis_client.delete(queue_name)
+            frappe.logger().info(f"Cancelled import: removed {items_removed} items from queue {queue_name}")
+
+        # Also clean up any other xml_import queues
+        all_queues = redis_client.keys("xml_import_*")
+        for queue in all_queues:
+            queue_key = queue.decode() if isinstance(queue, bytes) else queue
+            if queue_key != IMPORT_PROGRESS_KEY:
+                redis_client.delete(queue_key)
+                frappe.logger().info(f"Cleaned up queue: {queue_key}")
+
+        # Delete progress key
+        redis_client.delete(IMPORT_PROGRESS_KEY)
+
+        return {
+            "success": True,
+            "message": f"Import cancelled. Removed {items_removed} pending items.",
+            "items_removed": items_removed,
+            "queue_name": queue_name
+        }
+
+    except Exception as e:
+        frappe.log_error(f"Error cancelling import: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@frappe.whitelist()
+def import_xml_items_sax(xml_source: str, company: str = None,
+                        use_queue: bool = True) -> Dict[str, Any]:
+    """
+    Import items from XML feed using SAX parser with Redis queue
+
+    This function always uses Redis queue for memory-optimized background processing.
+    The use_queue parameter is kept for backward compatibility.
+
+    Args:
+        xml_source: URL or file path to XML feed
+        company: Company name (optional)
+        use_queue: Kept for backward compatibility (always True)
+
+    Returns:
+        Dict with import results
+    """
+    try:
+        result = _import_xml_items_sax_internal(xml_source, company, use_queue)
+
+        # Create import log when running as background job
+        if frappe.local.job:
+            _create_import_log_from_result(xml_source, result, "Items")
+            _update_config_status(xml_source, result)
+
+        return result
+
+    except Exception as e:
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "imported": 0,
+            "updated": 0,
+            "errors": 1,
+            "error_messages": [str(e)]
+        }
+
+        # Log error when running as background job
+        if frappe.local.job:
+            _create_import_log_from_result(xml_source, error_result, "Items")
+            _update_config_status(xml_source, error_result)
+
+        raise
+
+
+def _import_xml_items_sax_internal(xml_source: str, company: str = None,
+                                  use_queue: bool = True) -> Dict[str, Any]:
+    """
+    Import items from XML feed using SAX parser with Redis queue
+
+    This function always uses Redis queue for memory-optimized background processing.
+    The use_queue parameter is kept for backward compatibility.
+
+    Args:
+        xml_source: URL or file path to XML feed
+        company: Company name (optional)
+        use_queue: Kept for backward compatibility (always True)
+
+    Returns:
+        Dict with import results
+    """
+    try:
+        frappe.logger().info(f"Starting SAX-based XML import from: {xml_source}")
+
+        # Create importer to use existing functionality
+        importer = XMLItemImporter(xml_source, company)
+
+        # Fetch XML content
+        xml_content = importer.fetch_xml_content()
+
+        # Always use Redis for memory efficiency
+        if not REDIS_AVAILABLE:
+            frappe.throw("Redis package not installed. Install with: pip install redis")
+
+        redis_client = get_redis_client()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        queue_name = f"xml_import_items_{timestamp}"
+
+        # Phase 1: Parse XML with SAX and queue items
+        frappe.logger().info("Phase 1: Parsing XML and queueing items...")
+        handler = SAXItemHandler(redis_client, queue_name)
+        parser = xml.sax.make_parser()
+        parser.setContentHandler(handler)
+
+        from io import StringIO
+        parser.parse(StringIO(xml_content))
+
+        # Finalize parsing phase - update total count in Redis
+        handler.finalize_parsing()
+
+        # Get statistics from parsing phase
+        stats = handler.get_stats()
+        total_items = stats['items_queued']
+        frappe.logger().info(f"Queued {total_items} items for processing")
+
+        # Phase 2: Process queued items
+        frappe.logger().info("Phase 2: Processing queued items...")
+        processed_count = 0
+        error_count = 0
+        errors = []
+
+        # Update progress to show processing started
+        _update_import_progress(redis_client, "processing", total_items, 0, 0, queue_name)
+
+        while True:
+            # Get item from queue
+            item_data = redis_client.rpop(queue_name)
+            if not item_data:
+                break
+
+            try:
+                queue_entry = json.loads(item_data.decode('utf-8'))
+
+                # Extract the actual item data from the queue entry
+                item_dict = queue_entry.get("item_data", {})
+
+                # Convert SAX format to legacy format for processing
+                legacy_item = convert_sax_to_legacy_format(item_dict)
+
+                # Process the item using existing methods
+                success = importer.create_or_update_item(legacy_item)
+
+                if success:
+                    processed_count += 1
+                else:
+                    error_count += 1
+                    item_identifier = legacy_item.get('item_code', item_dict.get('item_id', 'Unknown'))
+                    errors.append(f"Failed to process item: {item_identifier}")
+
+                    # Log more details for debugging
+                    frappe.logger().warning(f"Failed to process item {item_identifier}. Item data keys: {list(item_dict.keys())}")
+
+                # Progress update every 100 items
+                total_processed = processed_count + error_count
+                if total_processed % 100 == 0:
+                    # Update Redis progress
+                    _update_import_progress(redis_client, "processing", total_items, total_processed, error_count, queue_name)
+
+                    frappe.publish_realtime(
+                        "sax_import_progress",
+                        {
+                            "phase": "processing",
+                            "total": total_items,
+                            "processed": total_processed,
+                            "imported": importer.imported_count,
+                            "updated": importer.updated_count,
+                            "errors": error_count
+                        },
+                        user=frappe.session.user
+                    )
+
+            except Exception as e:
+                error_count += 1
+                error_msg = f"Error processing item {processed_count + error_count}: {str(e)}"
+                errors.append(error_msg)
+                frappe.log_error(error_msg)
+
+        # Clean up queue
+        redis_client.delete(queue_name)
+
+        # Final counts from the importer instance
+        imported_count = importer.imported_count
+        updated_count = importer.updated_count
+
+        # Mark progress as complete
+        _update_import_progress(redis_client, "complete", total_items, processed_count + error_count, error_count, queue_name, completed=True)
+
+        # Send completion message
+        frappe.publish_realtime(
+            "sax_import_progress",
+            {
+                "phase": "complete",
+                "message": "SAX import completed successfully",
+                "completed": True,
+                "total": total_items,
+                "items_processed": processed_count,
+                "errors": error_count
+            },
+            user=frappe.session.user
+        )
+
+        # Return summary
+        summary = {
+            "success": True,
+            "imported": imported_count,
+            "updated": updated_count,
+            "errors": error_count,
+            "error_messages": errors[:10],  # First 10 errors
+            "total_processed": processed_count,
+            "sax_stats": stats,
+            "method": "sax_with_queue",
+            "queue_name": queue_name
+        }
+
+        frappe.logger().info(f"SAX import completed: {summary}")
+        return summary
+
+    except Exception as e:
+        error_msg = f"SAX XML import failed: {str(e)}"
+        frappe.log_error(error_msg)
+        return {
+            "success": False,
+            "error": error_msg,
+            "imported": 0,
+            "updated": 0,
+            "errors": 1
+        }
+
+
+def convert_sax_to_legacy_format(sax_item_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert SAX-parsed item data to legacy format.
+    This now passes through all data and lets normalize_item_data handle the conversion.
+    """
+    # Pass through all original data - normalize_item_data will handle field mapping
+    converted = sax_item_data.copy()
+
+    # Ensure we capture item_name from NAME tag (stored in additional_data)
+    additional_data = sax_item_data.get("additional_data", {})
+
+    # Map NAME from additional_data if item_name not set
+    if additional_data.get("name") and not converted.get("item_name"):
+        converted["item_name"] = additional_data["name"]
+
+    # Map DEFAULT_CATEGORY from additional_data if not set
+    if additional_data.get("default_category") and not converted.get("default_category"):
+        converted["default_category"] = additional_data["default_category"]
+
+    # Debug logging
+    item_id = sax_item_data.get('item_code') or sax_item_data.get('item_id') or 'Unknown'
+    frappe.logger().debug(f"Convert SAX item {item_id}: item_name={converted.get('item_name')}, default_category={converted.get('default_category')}")
+
+    return converted
+
+
+def _create_import_log_from_result(xml_source: str, result: Dict[str, Any], import_type: str):
+    """Create import log entry from result"""
+    try:
+        if import_type == "Items":
+            from xml_importer.xml_importer.doctype.xml_import_log.xml_import_log import create_item_import_log
+            create_item_import_log(
+                xml_source=xml_source,
+                status="Success" if result.get("success") else "Failed",
+                imported=result.get("imported", 0),
+                updated=result.get("updated", 0),
+                errors=result.get("errors", 0),
+                error_details="\n".join(result.get("error_messages", [])),
+                summary=result
+            )
+    except Exception as e:
+        frappe.log_error(f"Failed to create import log: {str(e)}")
+
+
+def _update_config_status(xml_source: str, result: Dict[str, Any]):
+    """Update configuration status based on result"""
+    try:
+        # Find configuration by XML feed URL
+        configs = frappe.get_all(
+            "XML Import Configuration",
+            filters={"xml_feed_url": xml_source},
+            fields=["name"]
+        )
+
+        for config in configs:
+            config_doc = frappe.get_doc("XML Import Configuration", config.name)
+            config_doc.db_set("last_import", frappe.utils.now())
+            config_doc.db_set("last_import_status", "Success" if result.get("success") else "Failed")
+
+    except Exception as e:
+        frappe.log_error(f"Failed to update config status: {str(e)}")
+
+
+@frappe.whitelist()
+def test_sax_memory_usage(xml_source: str, company: str = None) -> Dict[str, Any]:
+    """
+    Compare memory usage between DOM and SAX parsing methods
+
+    Args:
+        xml_source: URL or file path to XML feed
+        company: Company name
+
+    Returns:
+        Dict with memory comparison results
+    """
+    results = {"dom_method": {}, "sax_method": {}, "comparison": {}}
+
+    try:
+        process = psutil.Process(os.getpid())
+
+        # Test DOM method
+        frappe.logger().info("Testing DOM memory usage...")
+        gc.collect()
+        start_memory = process.memory_info().rss / 1024 / 1024  # MB
+        start_time = time.time()
+
+        dom_result = import_xml_items(xml_source, company)
+
+        dom_time = time.time() - start_time
+        dom_memory = process.memory_info().rss / 1024 / 1024 - start_memory
+
+        results["dom_method"] = {
+            "processing_time": dom_time,
+            "memory_usage_mb": dom_memory,
+            "success": dom_result.get("success", False),
+            "items_processed": dom_result.get("imported", 0)
+        }
+
+        # Clean up and test SAX method
+        gc.collect()
+        time.sleep(1)
+
+        frappe.logger().info("Testing SAX memory usage...")
+        start_memory = process.memory_info().rss / 1024 / 1024
+        start_time = time.time()
+
+        sax_result = import_xml_items_sax(xml_source, company, use_queue=False)
+
+        sax_time = time.time() - start_time
+        sax_memory = process.memory_info().rss / 1024 / 1024 - start_memory
+
+        results["sax_method"] = {
+            "processing_time": sax_time,
+            "memory_usage_mb": sax_memory,
+            "success": sax_result.get("success", False),
+            "items_processed": sax_result.get("imported", 0)
+        }
+
+        # Calculate improvement
+        if dom_memory > 0:
+            memory_improvement = ((dom_memory - sax_memory) / dom_memory) * 100
+            time_change = ((dom_time - sax_time) / dom_time) * 100 if dom_time > 0 else 0
+
+            results["comparison"] = {
+                "memory_savings_mb": dom_memory - sax_memory,
+                "memory_improvement_percent": memory_improvement,
+                "time_change_percent": time_change,
+                "recommendation": "SAX parser" if memory_improvement > 10 else "DOM parser"
+            }
+
+        frappe.logger().info(f"Memory comparison completed: {results['comparison']}")
+
+    except Exception as e:
+        results["error"] = str(e)
+        frappe.log_error(f"Memory test failed: {str(e)}")
+
+    return results

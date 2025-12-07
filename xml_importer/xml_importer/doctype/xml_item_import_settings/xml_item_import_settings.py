@@ -49,18 +49,18 @@ class XMLItemImportSettings(Document):
 
 	@frappe.whitelist()
 	def trigger_manual_import(self):
-		"""Manually trigger XML import"""
+		"""Manually trigger XML import using SAX parser with Redis queue"""
 		if not self.enabled:
 			frappe.throw("XML Import is not enabled. Please enable it first.")
 
 		if not self.xml_feed_url:
 			frappe.throw("XML Feed URL is required")
 
-		from xml_importer.xml_importer.item_importer import import_xml_items
+		from xml_importer.xml_importer.item_importer import import_xml_items_sax
 
 		try:
-			# Run the import
-			result = import_xml_items(self.xml_feed_url, self.company)
+			# Run the import using SAX parser with Redis queue
+			result = import_xml_items_sax(self.xml_feed_url, self.company, use_queue=True)
 
 			# Update last import status
 			self.db_set("last_import", frappe.utils.now())
