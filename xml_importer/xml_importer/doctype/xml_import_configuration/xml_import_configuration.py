@@ -28,7 +28,8 @@ class XMLImportConfiguration(Document):
 					job_name=f"XML Item Import - {self.name}",
 					xml_source=self.xml_feed_url,
 					company=self.company,
-					use_queue=use_queue
+					use_queue=use_queue,
+					config=self.get_import_specific_fields()
 				)
 
 				# Update configuration with job info

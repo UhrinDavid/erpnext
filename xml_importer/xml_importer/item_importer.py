@@ -1236,12 +1236,21 @@ class XMLItemImporter:
                 self.imported_count += 1
                 frappe.logger().info(f"Created item: {item_code}")
 
-            # Handle images
-            if item_data.get('product_images'):
-                self.handle_item_images(existing_item, item_data.get('product_images', []))
-            elif item_data.get('image_url'):
-                # Handle single image URL (legacy format)
-                self.handle_item_images(existing_item, [{'image_url': item_data.get('image_url')}])
+            # Handle images (only if download_images is enabled in config)
+            should_download_images = True
+            if self.config:
+                should_download_images = self.config.get('download_images', True)
+
+            if should_download_images:
+                if item_data.get('product_images'):
+                    self.handle_item_images(existing_item, item_data.get('product_images', []))
+                elif item_data.get('image_url'):
+                    # Handle single image URL (legacy format)
+                    self.handle_item_images(existing_item, [{'image_url': item_data.get('image_url')}])
+            else:
+                # Log that images are being skipped
+                if item_data.get('product_images') or item_data.get('image_url'):
+                    frappe.logger().debug(f"Skipping image download for {item_code} (download_images disabled in config)")
 
             # Create/update item price
             self.create_item_price(existing_item, item_data)
@@ -2406,7 +2415,7 @@ def cancel_import() -> Dict[str, Any]:
 
 @frappe.whitelist()
 def import_xml_items_sax(xml_source: str, company: str = None,
-                        use_queue: bool = True) -> Dict[str, Any]:
+                        use_queue: bool = True, config: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Import items from XML feed using SAX parser with Redis queue
 
@@ -2417,12 +2426,13 @@ def import_xml_items_sax(xml_source: str, company: str = None,
         xml_source: URL or file path to XML feed
         company: Company name (optional)
         use_queue: Kept for backward compatibility (always True)
+        config: Import configuration options (download_images, create_item_groups, etc.)
 
     Returns:
         Dict with import results
     """
     try:
-        result = _import_xml_items_sax_internal(xml_source, company, use_queue)
+        result = _import_xml_items_sax_internal(xml_source, company, use_queue, config)
 
         # Create import log when running as background job
         if frappe.local.job:
@@ -2450,7 +2460,7 @@ def import_xml_items_sax(xml_source: str, company: str = None,
 
 
 def _import_xml_items_sax_internal(xml_source: str, company: str = None,
-                                  use_queue: bool = True) -> Dict[str, Any]:
+                                  use_queue: bool = True, config: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Import items from XML feed using SAX parser with Redis queue
 
@@ -2461,15 +2471,18 @@ def _import_xml_items_sax_internal(xml_source: str, company: str = None,
         xml_source: URL or file path to XML feed
         company: Company name (optional)
         use_queue: Kept for backward compatibility (always True)
+        config: Import configuration options (download_images, create_item_groups, etc.)
 
     Returns:
         Dict with import results
     """
     try:
         frappe.logger().info(f"Starting SAX-based XML import from: {xml_source}")
+        if config:
+            frappe.logger().info(f"Import config: {config}")
 
         # Create importer to use existing functionality
-        importer = XMLItemImporter(xml_source, company)
+        importer = XMLItemImporter(xml_source, company, config)
 
         # Fetch XML content
         xml_content = importer.fetch_xml_content()

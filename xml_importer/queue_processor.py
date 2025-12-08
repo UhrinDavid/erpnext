@@ -49,7 +49,8 @@ class RedisQueueProcessor:
             return redis.Redis(host='localhost', port=6379, db=0)
 
     def process_item_queue(self, queue_name: str, company: str = None,
-                          max_items: int = None, timeout: int = 300) -> Dict[str, Any]:
+                          max_items: int = None, timeout: int = 300,
+                          config: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Process items from Redis queue
 
@@ -58,6 +59,7 @@ class RedisQueueProcessor:
             company: ERPNext company name
             max_items: Maximum number of items to process (None for all)
             timeout: Maximum processing time in seconds
+            config: Import configuration options (download_images, create_item_groups, etc.)
 
         Returns:
             Dict with processing statistics
@@ -70,8 +72,8 @@ class RedisQueueProcessor:
         error_details = []
 
         try:
-            # Create item importer instance
-            importer = XMLItemImporter(company=company)
+            # Create item importer instance with config
+            importer = XMLItemImporter(company=company, config=config)
 
             frappe.logger().info(f"Starting to process item queue: {queue_name}")
 
@@ -339,7 +341,8 @@ class RedisQueueProcessor:
 
 @frappe.whitelist()
 def process_redis_queue(queue_name: str, content_type: str = "items",
-                       company: str = None, max_items: int = None) -> Dict[str, Any]:
+                       company: str = None, max_items: int = None,
+                       config: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Public API to process a Redis queue
 
@@ -348,6 +351,7 @@ def process_redis_queue(queue_name: str, content_type: str = "items",
         content_type: "items" or "orders"
         company: ERPNext company name
         max_items: Maximum number of items to process
+        config: Import configuration options (download_images, create_item_groups, etc.)
 
     Returns:
         Dict with processing results
@@ -355,7 +359,7 @@ def process_redis_queue(queue_name: str, content_type: str = "items",
     processor = RedisQueueProcessor()
 
     if content_type == "items":
-        return processor.process_item_queue(queue_name, company, max_items)
+        return processor.process_item_queue(queue_name, company, max_items, config=config)
     elif content_type == "orders":
         return processor.process_order_queue(queue_name, company, max_items)
     else:

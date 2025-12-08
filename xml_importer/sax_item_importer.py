@@ -121,11 +121,12 @@ class SAXXMLItemImporter(OriginalXMLItemImporter):
                 user=frappe.session.user
             )
 
-            # Process the queue
+            # Process the queue with config
             process_result = self.queue_processor.process_item_queue(
                 queue_name=queue_name,
                 company=self.company,
-                timeout=self.queue_processor_timeout
+                timeout=self.queue_processor_timeout,
+                config=self.config
             )
 
             if not process_result.get("success", False):
@@ -421,7 +422,7 @@ class SAXXMLItemImporter(OriginalXMLItemImporter):
 # Public API functions (replacements for original functions)
 @frappe.whitelist()
 def import_xml_items_sax(xml_source: str, company: str = None,
-                        use_queue: bool = True) -> Dict[str, Any]:
+                        use_queue: bool = True, config: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Import items from XML feed using SAX parser with Redis queue
 
@@ -432,11 +433,12 @@ def import_xml_items_sax(xml_source: str, company: str = None,
         xml_source: URL or file path to XML feed
         company: Company name (optional)
         use_queue: Kept for backward compatibility (always True)
+        config: Import configuration options (download_images, create_item_groups, etc.)
 
     Returns:
         Dict with import results
     """
-    importer = SAXXMLItemImporter(xml_source, company)
+    importer = SAXXMLItemImporter(xml_source, company, config)
     return importer.import_from_xml()
 
 

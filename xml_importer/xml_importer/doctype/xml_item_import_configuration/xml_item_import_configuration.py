@@ -47,11 +47,12 @@ def execute_background_import(import_type, xml_feed_url, company, config_name):
 		config_doc = frappe.get_doc("XML Item Import Configuration", config_name)
 		use_sax = config_doc.get("use_sax_parser", True)  # Default to SAX for memory efficiency
 		use_queue = config_doc.get("use_redis_queue", True)  # Default to queue for background processing
+		import_config = config_doc.get_import_specific_fields() if hasattr(config_doc, 'get_import_specific_fields') else None
 
 		if import_type == "Items":
 			if use_sax:
 				from xml_importer.xml_importer.sax_item_importer import import_xml_items_sax
-				result = import_xml_items_sax(xml_feed_url, company, use_queue)
+				result = import_xml_items_sax(xml_feed_url, company, use_queue, config=import_config)
 			else:
 				from xml_importer.xml_importer.item_importer import import_xml_items
 				result = import_xml_items(xml_feed_url, company)
