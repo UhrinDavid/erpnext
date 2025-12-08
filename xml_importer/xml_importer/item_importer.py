@@ -1315,21 +1315,19 @@ class XMLItemImporter:
             currency = item_data.get('currency_code', 'EUR')
 
             # Standard retail selling price (with tax)
-            selling_price = item_data.get('selling_price_with_tax')
+            selling_price = flt(item_data.get('selling_price_with_tax'))
             if selling_price:
                 self.create_or_update_price("Standard Selling", item_doc.item_code, selling_price, currency)
 
             # Wholesale selling price (if available)
-            wholesale_price = item_data.get('wholesale_price')
+            wholesale_price = flt(item_data.get('wholesale_price'))
             if wholesale_price:
-                # Ensure wholesale price list exists
                 self.ensure_price_list_exists("Veľkoobchod", currency)
                 self.create_or_update_price("Veľkoobchod", item_doc.item_code, wholesale_price, currency)
 
             # Standard buying price (purchase price)
-            purchase_price = item_data.get('purchase_price')
+            purchase_price = flt(item_data.get('purchase_price'))
             if purchase_price:
-                # Ensure buying price list exists
                 self.ensure_price_list_exists("Standard Buying", currency, selling=False)
                 self.create_or_update_price("Standard Buying", item_doc.item_code, purchase_price, currency)
 
@@ -2017,12 +2015,14 @@ class SAXItemHandler(xml.sax.ContentHandler):
                 self.current_pricelist["title"] = data
             # Handle PRICE_VAT - context-aware (variant vs top-level vs pricelist)
             elif name == "PRICE_VAT":
-                if self.in_pricelist:
-                    self.current_pricelist["price_vat"] = data
-                elif self.in_variant:
-                    self.current_variant["price_vat"] = data
-                else:
-                    self.current_item["price_vat"] = data
+                # Only set if not empty - avoid overwriting with empty value
+                if data:
+                    if self.in_pricelist:
+                        self.current_pricelist["price_vat"] = data
+                    elif self.in_variant:
+                        self.current_variant["price_vat"] = data
+                    else:
+                        self.current_item["price_vat"] = data
             # Handle NAME element - only at top level under SHOPITEM (depth 3: SHOP > SHOPITEM > NAME)
             # Also handle NAME inside PARAMETER
             elif name == "NAME":
@@ -2049,20 +2049,24 @@ class SAXItemHandler(xml.sax.ContentHandler):
             elif name == "IMGURL":
                 self.current_item["image_url"] = data
             elif name == "PRICE":
-                if self.in_variant:
-                    self.current_variant["price"] = data
-                else:
-                    self.current_item["price"] = data
+                # Only set if not empty - avoid overwriting with empty value
+                if data:
+                    if self.in_variant:
+                        self.current_variant["price"] = data
+                    else:
+                        self.current_item["price"] = data
             elif name == "VAT":
                 if self.in_variant:
                     self.current_variant["vat"] = data
                 else:
                     self.current_item["vat_rate"] = data
             elif name == "PURCHASE_PRICE":
-                if self.in_variant:
-                    self.current_variant["purchase_price"] = data
-                else:
-                    self.current_item["purchase_price"] = data
+                # Only set if not empty - avoid overwriting with empty value
+                if data:
+                    if self.in_variant:
+                        self.current_variant["purchase_price"] = data
+                    else:
+                        self.current_item["purchase_price"] = data
             elif name == "MANUFACTURER":
                 self.current_item["manufacturer"] = data
             elif name == "EAN":
