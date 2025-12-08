@@ -425,6 +425,9 @@ class XMLOrderImporter:
             if existing_address:
                 return existing_address
 
+            # Map country name to ERPNext country
+            country = self.map_country_name(address_data.get('country', ''))
+
             # Create new address
             address_doc = frappe.get_doc({
                 "doctype": "Address",
@@ -433,7 +436,7 @@ class XMLOrderImporter:
                 "address_line1": address_line1,
                 "city": address_data.get('city', ''),
                 "pincode": address_data.get('postal_code', ''),
-                "country": address_data.get('country', 'Slovakia'),
+                "country": country,
                 "links": [{
                     "link_doctype": "Customer",
                     "link_name": customer_name
@@ -447,27 +450,35 @@ class XMLOrderImporter:
             frappe.log_error(f"Failed to create address: {str(e)}")
             return None
 
-    def create_or_update_order(self, order_data: Dict[str, Any]) -> bool:
-        """Create or update ERPNext Sales Order"""
+    def create_or_update_order(self, order_data: Dict[str, Any]) -> tuple:
+        """Create or update ERPNext Sales Order
+
+        Returns:
+            tuple: (status, reason) where status is:
+                'imported' - new order created
+                'skipped' - order skipped (cancelled or already exists)
+                'error' - failed to process
+            and reason is the skip/error reason
+        """
         try:
             external_order_id = order_data.get('external_order_id')
             if not external_order_id:
                 self.add_error("Missing external order ID")
-                return False
+                return ('error', 'missing_id')
 
             # Skip cancelled/storno orders
             order_status = order_data.get('order_status', '').lower()
             if 'storno' in order_status or 'cancel' in order_status or 'zrušen' in order_status:
                 frappe.logger().info(f"Skipping cancelled order {external_order_id} with status: {order_data.get('order_status')}")
-                return True
+                return ('skipped', 'cancelled')
 
             # Check if order exists
             existing_order = frappe.db.get_value("Sales Order", {"po_no": external_order_id}, "name")
 
             if existing_order:
                 # Skip if order already exists
-                frappe.logger().info(f"Order {external_order_id} already exists, skipping")
-                return True
+                frappe.logger().info(f"Order {external_order_id} already exists as {existing_order}, skipping")
+                return ('skipped', 'exists')
 
             # Create customer
             customer_name = self.create_or_update_customer(order_data)
@@ -494,16 +505,22 @@ class XMLOrderImporter:
 
             # Process order items
             product_items_added = 0
+            all_item_types = []
+            failed_items = []
             for item_data in order_data.get('order_items', []):
-                # Only add product items to sales order
-                if item_data.get('item_type') == 'product':
+                item_type = item_data.get('item_type', '').lower()
+                all_item_types.append(f"{item_type}:{item_data.get('item_code', 'no_code')}")
+                # Only add product items to sales order (accept 'product' or empty/None for backwards compatibility)
+                if item_type == 'product' or item_type == '' or item_type is None:
                     if self.add_order_item(sales_order, item_data):
                         product_items_added += 1
+                    else:
+                        failed_items.append(item_data.get('item_code', item_data.get('item_name', 'unknown')))
 
             # Only create order if we have product items
             if product_items_added == 0:
-                frappe.logger().info(f"No valid product items found for order {external_order_id}, skipping")
-                return True
+                frappe.logger().warning(f"No valid product items for order {external_order_id}: items={all_item_types}, failed={failed_items}")
+                return ('skipped', 'no_products')
 
             # Set totals
             sales_order.run_method("calculate_taxes_and_totals")
@@ -525,14 +542,14 @@ class XMLOrderImporter:
             self.imported_count += 1
             frappe.logger().info(f"Created Sales Order: {sales_order.name} for external order {external_order_id}")
 
-            return True
+            return ('imported', sales_order.name)
 
         except Exception as e:
             frappe.db.rollback()
             error_msg = f"Failed to process order {order_data.get('external_order_id', 'Unknown')}: {str(e)}"
             self.add_error(error_msg)
             frappe.log_error(error_msg)
-            return False
+            return ('error', str(e))
 
     def add_order_item(self, sales_order: Document, item_data: Dict[str, Any]) -> bool:
         """Add item to sales order"""
@@ -551,13 +568,25 @@ class XMLOrderImporter:
             # Add item to sales order
             item_row = sales_order.append("items", {})
             item_row.item_code = item_code
-            item_row.item_name = item_data.get('item_name', item_code)
-            item_row.qty = item_data.get('quantity', 1)
-            item_row.rate = item_data.get('unit_price_without_tax', 0)
 
-            # If rate is 0, try to get it from with_tax price
-            if item_row.rate == 0:
-                item_row.rate = item_data.get('unit_price_with_tax', 0)
+            # Ensure item_name is set (required field) - fallback to item_code if empty
+            item_name = item_data.get('item_name') or ''
+            item_row.item_name = item_name.strip() if item_name.strip() else item_code
+
+            # Parse quantity (handle comma decimal separator)
+            qty = self.parse_decimal(str(item_data.get('quantity', 1)))
+            item_row.qty = qty if qty > 0 else 1
+
+            # Get rate - try multiple field names and parse decimal
+            rate = 0
+            rate_fields = ['unit_price_without_vat', 'unit_price_without_tax', 'unit_price_with_vat', 'unit_price_with_tax']
+            for field in rate_fields:
+                if item_data.get(field):
+                    rate = self.parse_decimal(str(item_data.get(field)))
+                    if rate > 0:
+                        break
+
+            item_row.rate = rate
 
             # Calculate amount
             item_row.amount = item_row.qty * item_row.rate
@@ -573,7 +602,7 @@ class XMLOrderImporter:
             if default_warehouse:
                 item_row.warehouse = default_warehouse
 
-            frappe.logger().info(f"Added item {item_code} to sales order")
+            frappe.logger().info(f"Added item {item_code} qty={item_row.qty} rate={item_row.rate} to sales order")
             return True
 
         except Exception as e:
@@ -845,35 +874,218 @@ class SAXOrderHandler(xml.sax.ContentHandler):
         self.redis_client = redis_client
         self.queue_name = queue_name or f"xml_orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.current_order = {}
-        self.current_element = ""
-        self.current_text = ""
+        self.current_item = {}
+        self.current_address = {}
+        self.element_stack = []
+        self.current_data = ""
         self.orders_processed = 0
 
+        # Context flags
+        self.in_order = False
+        self.in_customer = False
+        self.in_billing_address = False
+        self.in_shipping_address = False
+        self.in_currency = False
+        self.in_order_items = False
+        self.in_item = False
+        self.in_unit_price = False
+        self.in_total_price = False
+        self.in_item_total_price = False
+
     def startElement(self, name, attrs):
-        self.current_element = name.upper()
-        if name.upper() == "ORDER":
-            self.current_order = {}
+        self.element_stack.append(name.upper())
+        self.current_data = ""
+
+        name_upper = name.upper()
+
+        if name_upper == "ORDER":
+            self.in_order = True
+            self.current_order = {
+                "order_items": [],
+                "billing_address": {},
+                "shipping_address": {}
+            }
+        elif name_upper == "CUSTOMER" and self.in_order:
+            self.in_customer = True
+        elif name_upper == "BILLING_ADDRESS" and self.in_customer:
+            self.in_billing_address = True
+            self.current_address = {}
+        elif name_upper == "SHIPPING_ADDRESS" and self.in_customer:
+            self.in_shipping_address = True
+            self.current_address = {}
+        elif name_upper == "CURRENCY" and self.in_order and not self.in_item:
+            self.in_currency = True
+        elif name_upper == "ORDER_ITEMS" and self.in_order:
+            self.in_order_items = True
+        elif name_upper == "ITEM" and self.in_order_items:
+            self.in_item = True
+            self.current_item = {}
+        elif name_upper == "UNIT_PRICE" and self.in_item:
+            self.in_unit_price = True
+        elif name_upper == "TOTAL_PRICE":
+            if self.in_item:
+                self.in_item_total_price = True
+            elif self.in_order and not self.in_order_items:
+                self.in_total_price = True
 
     def endElement(self, name):
-        if name.upper() == "ORDER" and self.current_order:
-            # Queue order for processing
-            if self.redis_client:
-                order_json = json.dumps(self.current_order)
-                self.redis_client.lpush(self.queue_name, order_json)
-            self.orders_processed += 1
-            self.current_order = {}
-        elif self.current_element in ["ORDER_ID", "CUSTOMER_NAME", "CUSTOMER_EMAIL", "ORDER_STATUS", "ORDER_DATE", "TOTAL_AMOUNT"]:
-            self.current_order[self.current_element.lower()] = self.current_text.strip()
+        name_upper = name.upper()
+        data = self.current_data.strip()
 
-        self.current_element = ""
-        self.current_text = ""
+        if name_upper == "ORDER" and self.in_order:
+            # Queue order for processing
+            if self.redis_client and self.current_order.get("external_order_id"):
+                order_json = json.dumps(self.current_order, ensure_ascii=False)
+                self.redis_client.lpush(self.queue_name, order_json)
+                self.orders_processed += 1
+            self.current_order = {}
+            self.in_order = False
+
+        elif name_upper == "CUSTOMER":
+            self.in_customer = False
+
+        elif name_upper == "BILLING_ADDRESS" and self.in_billing_address:
+            self.current_order["billing_address"] = self.current_address.copy()
+            self.current_address = {}
+            self.in_billing_address = False
+
+        elif name_upper == "SHIPPING_ADDRESS" and self.in_shipping_address:
+            self.current_order["shipping_address"] = self.current_address.copy()
+            self.current_address = {}
+            self.in_shipping_address = False
+
+        elif name_upper == "CURRENCY" and self.in_currency:
+            self.in_currency = False
+
+        elif name_upper == "ORDER_ITEMS":
+            self.in_order_items = False
+
+        elif name_upper == "ITEM" and self.in_item:
+            self.current_order["order_items"].append(self.current_item.copy())
+            self.current_item = {}
+            self.in_item = False
+
+        elif name_upper == "UNIT_PRICE":
+            self.in_unit_price = False
+
+        elif name_upper == "TOTAL_PRICE":
+            if self.in_item_total_price:
+                self.in_item_total_price = False
+            else:
+                self.in_total_price = False
+
+        # Parse order-level fields
+        elif self.in_order and not self.in_customer and not self.in_order_items and not self.in_total_price:
+            if name_upper == "ORDER_ID":
+                self.current_order["external_order_id"] = data
+            elif name_upper == "CODE":
+                self.current_order["order_code"] = data
+            elif name_upper == "DATE":
+                self.current_order["order_date"] = data
+            elif name_upper == "STATUS":
+                self.current_order["order_status"] = data
+            elif name_upper == "REMARK":
+                self.current_order["customer_remark"] = data
+            elif name_upper == "SHOP_REMARK":
+                self.current_order["shop_remark"] = data
+            elif name_upper == "PACKAGE_NUMBER":
+                self.current_order["package_number"] = data
+            elif name_upper == "WEIGHT":
+                self.current_order["weight"] = data
+            elif name_upper == "SOURCE_NAME":
+                self.current_order["source_name"] = data
+
+        # Parse currency fields
+        elif self.in_currency:
+            if name_upper == "CODE":
+                self.current_order["currency_code"] = data
+            elif name_upper == "EXCHANGE_RATE":
+                self.current_order["exchange_rate"] = data
+
+        # Parse customer fields
+        elif self.in_customer and not self.in_billing_address and not self.in_shipping_address:
+            if name_upper == "EMAIL":
+                self.current_order["customer_email"] = data
+            elif name_upper == "PHONE":
+                self.current_order["customer_phone"] = data
+            elif name_upper == "IP_ADDRESS":
+                self.current_order["ip_address"] = data
+
+        # Parse item fields - MUST come before address check since items have NAME too
+        elif self.in_item:
+            if self.in_unit_price:
+                if name_upper == "WITH_VAT":
+                    self.current_item["unit_price_with_vat"] = data
+                elif name_upper == "WITHOUT_VAT":
+                    self.current_item["unit_price_without_vat"] = data
+                elif name_upper == "VAT_RATE":
+                    self.current_item["vat_rate"] = data
+            elif self.in_item_total_price:
+                if name_upper == "WITH_VAT":
+                    self.current_item["total_price_with_vat"] = data
+                elif name_upper == "WITHOUT_VAT":
+                    self.current_item["total_price_without_vat"] = data
+            else:
+                item_field_map = {
+                    "TYPE": "item_type",
+                    "NAME": "item_name",
+                    "AMOUNT": "quantity",
+                    "CODE": "item_code",
+                    "VARIANT_NAME": "variant_name",
+                    "EAN": "ean",
+                    "MANUFACTURER": "manufacturer",
+                    "SUPPLIER": "supplier",
+                    "UNIT": "unit",
+                    "WEIGHT": "weight",
+                    "STATUS": "status",
+                    "DISCOUNT": "discount"
+                }
+                if name_upper in item_field_map:
+                    self.current_item[item_field_map[name_upper]] = data
+
+        # Parse billing/shipping address fields
+        elif self.in_billing_address or self.in_shipping_address:
+            field_map = {
+                "NAME": "customer_name",
+                "COMPANY": "company_name",
+                "STREET": "street",
+                "HOUSENUMBER": "house_number",
+                "CITY": "city",
+                "ZIP": "postal_code",
+                "COUNTRY": "country",
+                "COMPANY_ID": "company_id",
+                "VAT_ID": "vat_id",
+                "CUSTOMER_IDENTIFICATION_NUMBER": "customer_id_number"
+            }
+            if name_upper in field_map:
+                self.current_address[field_map[name_upper]] = data
+
+        # Parse order total price fields
+        elif self.in_total_price and not self.in_item:
+            if name_upper == "WITH_VAT":
+                self.current_order["total_with_vat"] = data
+            elif name_upper == "WITHOUT_VAT":
+                self.current_order["total_without_vat"] = data
+            elif name_upper == "VAT":
+                self.current_order["total_vat"] = data
+            elif name_upper == "PRICE_TO_PAY":
+                self.current_order["price_to_pay"] = data
+            elif name_upper == "PAID":
+                self.current_order["is_paid"] = data
+            elif name_upper == "AMOUNT_PAID":
+                self.current_order["amount_paid"] = data
+
+        # Pop from stack
+        if self.element_stack:
+            self.element_stack.pop()
+        self.current_data = ""
 
     def characters(self, content):
-        self.current_text += content
+        self.current_data += content
 
 
 def get_redis_client():
-    """Get Redis client connection"""
+    """Get Redis client connection with retry"""
     if not REDIS_AVAILABLE:
         frappe.throw("Redis package not installed. Install with: pip install redis")
 
@@ -882,15 +1094,19 @@ def get_redis_client():
         redis_config = frappe.conf.get("redis_queue") or frappe.conf.get("redis_cache")
 
         if isinstance(redis_config, str):
-            return redis.from_url(redis_config)
+            client = redis.from_url(redis_config, socket_timeout=5, socket_connect_timeout=5)
         elif isinstance(redis_config, dict):
-            return redis.Redis(**redis_config)
+            client = redis.Redis(**redis_config, socket_timeout=5, socket_connect_timeout=5)
         else:
-            return redis.Redis(host='localhost', port=6379, db=0)
+            client = redis.Redis(host='localhost', port=6379, db=0, socket_timeout=5, socket_connect_timeout=5)
+
+        # Test connection
+        client.ping()
+        return client
 
     except Exception as e:
         frappe.log_error(f"Redis connection error: {str(e)}")
-        return redis.Redis(host='localhost', port=6379, db=0)
+        raise
 
 
 @frappe.whitelist()
@@ -908,10 +1124,9 @@ def import_xml_orders_sax(xml_source: str, company: str = None) -> Dict[str, Any
     try:
         result = _import_xml_orders_sax_internal(xml_source, company)
 
-        # Create import log when running as background job
-        if frappe.local.job:
-            _create_order_import_log_from_result(xml_source, result)
-            _update_order_config_status(xml_source, result)
+        # Always create import log and update config status
+        _create_order_import_log_from_result(xml_source, result)
+        _update_order_config_status(xml_source, result)
 
         return result
 
@@ -925,10 +1140,9 @@ def import_xml_orders_sax(xml_source: str, company: str = None) -> Dict[str, Any
             "error_messages": [str(e)]
         }
 
-        # Log error when running as background job
-        if frappe.local.job:
-            _create_order_import_log_from_result(xml_source, error_result)
-            _update_order_config_status(xml_source, error_result)
+        # Log error
+        _create_order_import_log_from_result(xml_source, error_result)
+        _update_order_config_status(xml_source, error_result)
 
         raise
 
@@ -977,28 +1191,72 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
         processed_count = 0
         imported_count = 0
         updated_count = 0
+        skipped_count = 0
         error_count = 0
         errors = []
+        skip_reasons = {}  # Track skip reasons: {'exists': [...], 'cancelled': [...], 'no_products': [...]}
+        consecutive_failures = 0
+        max_consecutive_failures = 5
 
         while True:
-            # Get order from queue
-            order_data = redis_client.rpop(handler.queue_name)
+            # Get order from queue with retry on Redis errors
+            try:
+                order_data = redis_client.rpop(handler.queue_name)
+                consecutive_failures = 0  # Reset on success
+            except redis.exceptions.ConnectionError as ce:
+                consecutive_failures += 1
+                frappe.log_error(f"Redis connection error (attempt {consecutive_failures}): {str(ce)}")
+
+                if consecutive_failures >= max_consecutive_failures:
+                    error_msg = f"Redis connection failed {max_consecutive_failures} times, aborting"
+                    errors.append(error_msg)
+                    frappe.log_error(error_msg)
+                    break
+
+                # Try to reconnect
+                try:
+                    import time
+                    time.sleep(1)  # Wait before retry
+                    redis_client = get_redis_client()
+                    frappe.logger().info("Redis reconnected successfully")
+                    continue
+                except Exception as re:
+                    frappe.log_error(f"Redis reconnection failed: {str(re)}")
+                    continue
+            except Exception as e:
+                error_count += 1
+                error_msg = f"Redis error getting order: {str(e)}"
+                errors.append(error_msg)
+                frappe.log_error(error_msg)
+                break
+
             if not order_data:
                 break
 
             try:
                 order_dict = json.loads(order_data.decode('utf-8'))
+                external_id = order_dict.get('external_order_id', 'unknown')
 
                 # Convert SAX format to legacy format for processing
                 legacy_order = convert_sax_order_to_legacy_format(order_dict)
 
                 # Process the order using existing methods
-                result = importer.create_or_update_order(legacy_order)
+                result, reason = importer.create_or_update_order(legacy_order)
 
-                if result and result.get("created"):
+                # Track based on result string
+                if result == 'imported':
                     imported_count += 1
-                elif result and result.get("updated"):
-                    updated_count += 1
+                    frappe.logger().info(f"[ORDER IMPORT] Order {external_id} imported as {reason}")
+                elif result == 'skipped':
+                    skipped_count += 1
+                    # Track skip reasons
+                    if reason not in skip_reasons:
+                        skip_reasons[reason] = []
+                    skip_reasons[reason].append(external_id)
+                    frappe.logger().info(f"[ORDER IMPORT] Order {external_id} skipped: {reason}")
+                elif result == 'error':
+                    error_count += 1
+                    frappe.logger().error(f"[ORDER IMPORT] Order {external_id} failed: {reason}")
 
                 processed_count += 1
 
@@ -1010,6 +1268,7 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
                             "phase": "processing",
                             "processed": processed_count,
                             "imported": imported_count,
+                            "skipped": skipped_count,
                             "updated": updated_count,
                             "errors": error_count
                         },
@@ -1023,13 +1282,24 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
                 frappe.log_error(error_msg)
 
         # Clean up queue
-        redis_client.delete(handler.queue_name)
+        try:
+            redis_client.delete(handler.queue_name)
+        except Exception:
+            pass  # Ignore cleanup errors
+
+        # Log skip reasons summary
+        if skip_reasons:
+            frappe.logger().info(f"[ORDER IMPORT] Skip reasons summary:")
+            for reason, order_ids in skip_reasons.items():
+                frappe.logger().info(f"  - {reason}: {len(order_ids)} orders ({', '.join(order_ids[:5])}{'...' if len(order_ids) > 5 else ''})")
 
         # Final result
         result = {
             "success": True,
             "imported": imported_count,
             "updated": updated_count,
+            "skipped": skipped_count,
+            "skip_reasons": {k: len(v) for k, v in skip_reasons.items()},
             "errors": error_count,
             "error_messages": errors,
             "total_processed": processed_count,
@@ -1047,21 +1317,58 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
             "error": error_msg,
             "imported": 0,
             "updated": 0,
+            "skipped": 0,
             "errors": 1,
             "error_messages": [error_msg]
         }
 
 
 def convert_sax_order_to_legacy_format(sax_order_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert SAX-parsed order data to legacy format"""
+    """Convert SAX-parsed order data to legacy format expected by create_or_update_order"""
+
+    # Convert order items
+    order_items = []
+    for item in sax_order_data.get("order_items", []):
+        order_items.append({
+            "item_type": item.get("item_type", ""),
+            "item_name": item.get("item_name", ""),
+            "item_code": item.get("item_code", ""),
+            "quantity": item.get("quantity", "1"),
+            "ean": item.get("ean", ""),
+            "manufacturer": item.get("manufacturer", ""),
+            "supplier": item.get("supplier", ""),
+            "unit": item.get("unit", ""),
+            "weight": item.get("weight", ""),
+            "unit_price_with_vat": item.get("unit_price_with_vat", ""),
+            "unit_price_without_vat": item.get("unit_price_without_vat", ""),
+            "total_price_with_vat": item.get("total_price_with_vat", ""),
+            "total_price_without_vat": item.get("total_price_without_vat", ""),
+            "vat_rate": item.get("vat_rate", ""),
+            "discount": item.get("discount", "0")
+        })
+
     return {
-        "order_id": sax_order_data.get("order_id", ""),
-        "customer_name": sax_order_data.get("customer_name", ""),
-        "customer_email": sax_order_data.get("customer_email", ""),
-        "order_status": sax_order_data.get("order_status", ""),
+        "external_order_id": sax_order_data.get("external_order_id", ""),
+        "order_code": sax_order_data.get("order_code", ""),
         "order_date": sax_order_data.get("order_date", ""),
-        "total_amount": sax_order_data.get("total_amount", ""),
-        "additional_data": sax_order_data.get("additional_data", {})
+        "order_status": sax_order_data.get("order_status", ""),
+        "currency_code": sax_order_data.get("currency_code", "EUR"),
+        "exchange_rate": sax_order_data.get("exchange_rate", "1"),
+        "customer_email": sax_order_data.get("customer_email", ""),
+        "customer_phone": sax_order_data.get("customer_phone", ""),
+        "ip_address": sax_order_data.get("ip_address", ""),
+        "customer_remark": sax_order_data.get("customer_remark", ""),
+        "shop_remark": sax_order_data.get("shop_remark", ""),
+        "package_number": sax_order_data.get("package_number", ""),
+        "weight": sax_order_data.get("weight", ""),
+        "source_name": sax_order_data.get("source_name", ""),
+        "total_with_vat": sax_order_data.get("total_with_vat", ""),
+        "total_without_vat": sax_order_data.get("total_without_vat", ""),
+        "is_paid": sax_order_data.get("is_paid", "0"),
+        "amount_paid": sax_order_data.get("amount_paid", ""),
+        "billing_address": sax_order_data.get("billing_address", {}),
+        "shipping_address": sax_order_data.get("shipping_address", {}),
+        "order_items": order_items
     }
 
 
@@ -1085,17 +1392,34 @@ def _create_order_import_log_from_result(xml_source: str, result: Dict[str, Any]
 def _update_order_config_status(xml_source: str, result: Dict[str, Any]):
     """Update order configuration status based on result"""
     try:
-        # Find configuration by XML feed URL
+        # Find configuration by XML feed URL (try exact match first, then partial)
         configs = frappe.get_all(
             "XML Import Configuration",
             filters={"xml_feed_url": xml_source, "import_type": "Orders"},
             fields=["name"]
         )
 
+        # If no exact match, try to find by partial URL match
+        if not configs:
+            all_order_configs = frappe.get_all(
+                "XML Import Configuration",
+                filters={"import_type": "Orders"},
+                fields=["name", "xml_feed_url"]
+            )
+            for config in all_order_configs:
+                # Check if base URL matches (ignore query params)
+                config_base = config.xml_feed_url.split("?")[0] if config.xml_feed_url else ""
+                source_base = xml_source.split("?")[0] if xml_source else ""
+                if config_base and source_base and config_base == source_base:
+                    configs.append({"name": config.name})
+
         for config in configs:
-            config_doc = frappe.get_doc("XML Import Configuration", config.name)
+            config_doc = frappe.get_doc("XML Import Configuration", config["name"])
             config_doc.db_set("last_import", frappe.utils.now())
             config_doc.db_set("last_import_status", "Success" if result.get("success") else "Failed")
+            config_doc.db_set("last_import_count", result.get("imported", 0) + result.get("updated", 0))
+
+        frappe.db.commit()
 
     except Exception as e:
         frappe.log_error(f"Failed to update order config status: {str(e)}")
