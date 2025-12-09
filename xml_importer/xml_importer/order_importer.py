@@ -507,11 +507,13 @@ class XMLOrderImporter:
             product_items_added = 0
             all_item_types = []
             failed_items = []
+            # Valid product types: 'product', 'set' (product bundles), or empty for backwards compatibility
+            valid_product_types = ['product', 'set', '']
             for item_data in order_data.get('order_items', []):
                 item_type = item_data.get('item_type', '').lower()
                 all_item_types.append(f"{item_type}:{item_data.get('item_code', 'no_code')}")
-                # Only add product items to sales order (accept 'product' or empty/None for backwards compatibility)
-                if item_type == 'product' or item_type == '' or item_type is None:
+                # Only add product/set items to sales order (skip shipping, billing, discount)
+                if item_type in valid_product_types or item_type is None:
                     if self.add_order_item(sales_order, item_data):
                         product_items_added += 1
                     else:
@@ -1177,6 +1179,10 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
 
         # Phase 1: Parse XML with SAX and queue orders
         frappe.logger().info("Phase 1: Parsing XML and queueing orders...")
+
+        # Initialize progress tracking
+        _update_order_import_progress(redis_client, "parsing", 0, 0, 0, queue_name=queue_name)
+
         handler = SAXOrderHandler(redis_client, queue_name)
         parser = xml.sax.make_parser()
         parser.setContentHandler(handler)
@@ -1184,7 +1190,11 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
         from io import StringIO
         parser.parse(StringIO(xml_content))
 
-        frappe.logger().info(f"Queued {handler.orders_processed} orders for processing")
+        total_orders = handler.orders_processed
+        frappe.logger().info(f"Queued {total_orders} orders for processing")
+
+        # Update progress after parsing
+        _update_order_import_progress(redis_client, "processing", total_orders, 0, 0, queue_name=queue_name)
 
         # Phase 2: Process queued orders
         frappe.logger().info("Phase 2: Processing queued orders...")
@@ -1260,13 +1270,19 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
 
                 processed_count += 1
 
-                # Progress update every 100 orders
-                if processed_count % 100 == 0:
+                # Progress update every 10 orders (more frequent for orders than items)
+                if processed_count % 10 == 0:
+                    _update_order_import_progress(
+                        redis_client, "processing", total_orders, processed_count, error_count,
+                        imported=imported_count, skipped=skipped_count, queue_name=queue_name,
+                        skip_reasons=skip_reasons
+                    )
                     frappe.publish_realtime(
                         "sax_order_import_progress",
                         {
                             "phase": "processing",
                             "processed": processed_count,
+                            "total": total_orders,
                             "imported": imported_count,
                             "skipped": skipped_count,
                             "updated": updated_count,
@@ -1286,6 +1302,13 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
             redis_client.delete(handler.queue_name)
         except Exception:
             pass  # Ignore cleanup errors
+
+        # Final progress update (completed)
+        _update_order_import_progress(
+            redis_client, "complete", total_orders, processed_count, error_count,
+            imported=imported_count, skipped=skipped_count, queue_name=queue_name,
+            skip_reasons=skip_reasons, completed=True
+        )
 
         # Log skip reasons summary
         if skip_reasons:
@@ -1432,3 +1455,172 @@ def scheduled_xml_order_import():
     # This can be added to hooks.py for scheduled imports
     # For now, focusing on manual imports
     pass
+
+
+# ==================== ORDER PROGRESS TRACKING ====================
+
+# Progress tracking key for orders
+ORDER_IMPORT_PROGRESS_KEY = "xml_order_import_progress"
+
+
+def _update_order_import_progress(redis_client, phase: str, total: int, processed: int,
+                                  errors: int, imported: int = 0, skipped: int = 0,
+                                  queue_name: str = "", completed: bool = False,
+                                  skip_reasons: Dict = None):
+    """Update order import progress in Redis"""
+    try:
+        # Get existing data to preserve start_time
+        existing = redis_client.get(ORDER_IMPORT_PROGRESS_KEY)
+        start_time = datetime.now().isoformat()
+        if existing:
+            existing_data = json.loads(existing)
+            start_time = existing_data.get("start_time", start_time)
+
+        progress_data = {
+            "phase": phase,
+            "queue_name": queue_name,
+            "total_orders": total,
+            "processed": processed,
+            "imported": imported,
+            "skipped": skipped,
+            "errors": errors,
+            "skip_reasons": {k: len(v) for k, v in (skip_reasons or {}).items()},
+            "start_time": start_time,
+            "last_update": datetime.now().isoformat(),
+            "status": "complete" if completed else "running"
+        }
+        redis_client.set(ORDER_IMPORT_PROGRESS_KEY, json.dumps(progress_data))
+        # Set expiry - shorter if completed
+        redis_client.expire(ORDER_IMPORT_PROGRESS_KEY, 300 if completed else 3600)
+    except Exception as e:
+        frappe.log_error(f"Failed to update order import progress: {str(e)}")
+
+
+@frappe.whitelist()
+def get_order_import_progress() -> Dict[str, Any]:
+    """
+    Get current order import progress from Redis
+
+    Returns:
+        Dict with progress information or empty status if no import running
+    """
+    try:
+        if not REDIS_AVAILABLE:
+            return {"status": "no_redis", "message": "Redis not available"}
+
+        redis_client = get_redis_client()
+        progress_data = redis_client.get(ORDER_IMPORT_PROGRESS_KEY)
+
+        if not progress_data:
+            return {
+                "status": "idle",
+                "message": "No order import in progress",
+                "is_running": False
+            }
+
+        data = json.loads(progress_data)
+
+        # Calculate percentage
+        total = data.get("total_orders", 0)
+        processed = data.get("processed", 0)
+        percentage = round((processed / total * 100), 1) if total > 0 else 0
+
+        # Calculate elapsed time
+        start_time = data.get("start_time")
+        elapsed_seconds = 0
+        if start_time:
+            try:
+                start_dt = datetime.fromisoformat(start_time)
+                elapsed_seconds = (datetime.now() - start_dt).total_seconds()
+            except:
+                pass
+
+        # Format elapsed time
+        elapsed_str = ""
+        if elapsed_seconds > 0:
+            minutes = int(elapsed_seconds // 60)
+            seconds = int(elapsed_seconds % 60)
+            elapsed_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+
+        # Estimate remaining time
+        remaining_str = ""
+        if processed > 0 and total > processed:
+            rate = processed / elapsed_seconds if elapsed_seconds > 0 else 0
+            if rate > 0:
+                remaining_seconds = (total - processed) / rate
+                remaining_minutes = int(remaining_seconds // 60)
+                remaining_secs = int(remaining_seconds % 60)
+                remaining_str = f"{remaining_minutes}m {remaining_secs}s" if remaining_minutes > 0 else f"{remaining_secs}s"
+
+        return {
+            "status": data.get("status", "unknown"),
+            "phase": data.get("phase", "unknown"),
+            "is_running": data.get("status") == "running",
+            "total_items": total,
+            "processed": processed,
+            "imported": data.get("imported", 0),
+            "skipped": data.get("skipped", 0),
+            "errors": data.get("errors", 0),
+            "skip_reasons": data.get("skip_reasons", {}),
+            "percentage": percentage,
+            "elapsed_time": elapsed_str,
+            "remaining_time": remaining_str,
+            "queue_name": data.get("queue_name", ""),
+            "last_update": data.get("last_update", ""),
+            "message": f"Processing {processed}/{total} orders ({percentage}%)"
+        }
+
+    except Exception as e:
+        frappe.log_error(f"Error getting order import progress: {str(e)}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "is_running": False
+        }
+
+
+@frappe.whitelist()
+def cancel_order_import() -> Dict[str, Any]:
+    """
+    Cancel the current order import and clean up Redis
+
+    Returns:
+        Dict with cancellation result
+    """
+    try:
+        if not REDIS_AVAILABLE:
+            return {"success": False, "message": "Redis not available"}
+
+        redis_client = get_redis_client()
+
+        # Get current progress to find queue name
+        progress_data = redis_client.get(ORDER_IMPORT_PROGRESS_KEY)
+        queue_name = None
+
+        if progress_data:
+            data = json.loads(progress_data)
+            queue_name = data.get("queue_name")
+
+            # Mark as cancelled
+            data["status"] = "cancelled"
+            data["last_update"] = datetime.now().isoformat()
+            redis_client.set(ORDER_IMPORT_PROGRESS_KEY, json.dumps(data))
+            redis_client.expire(ORDER_IMPORT_PROGRESS_KEY, 60)  # Keep for 1 minute only
+
+        # Clear the queue if it exists
+        if queue_name:
+            redis_client.delete(queue_name)
+
+        return {
+            "success": True,
+            "message": f"Order import cancelled. Queue '{queue_name}' cleared.",
+            "queue_cleared": queue_name
+        }
+
+    except Exception as e:
+        frappe.log_error(f"Error cancelling order import: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+

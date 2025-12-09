@@ -1130,7 +1130,23 @@ class XMLItemImporter:
             # Set basic properties - use proper UOM
             uom = self.get_or_create_uom(item_data.get('unit_of_measure', 'Nos'))
             existing_item.stock_uom = uom
-            existing_item.is_stock_item = 1
+
+            # Determine if this is a set item (item_type='set' AND has set_items data)
+            is_set_item = item_data.get('item_type') == 'set' and item_data.get('set_items')
+            has_existing_bundle = frappe.db.exists("Product Bundle", item_code)
+
+            # Handle is_stock_item setting
+            if has_existing_bundle:
+                # If there's an existing bundle, ALWAYS keep is_stock_item = 0
+                existing_item.is_stock_item = 0
+            elif is_set_item:
+                # New set item - mark as non-stock (will create bundle later)
+                existing_item.is_stock_item = 0
+            elif not is_update:
+                # New regular item - mark as stock item
+                existing_item.is_stock_item = 1
+            # For existing regular items, don't change is_stock_item
+
             existing_item.include_item_in_manufacturing = 0
             existing_item.is_sales_item = 1
             existing_item.is_purchase_item = 1
@@ -1226,6 +1242,9 @@ class XMLItemImporter:
             if item_data.get('tax_rate'):
                 self.set_item_tax(existing_item, item_data)
 
+            # Note: is_set_item and has_existing_bundle were already set earlier
+            # and is_stock_item was already set correctly based on those values
+
             # Save the item
             if is_update:
                 existing_item.save(ignore_permissions=True)
@@ -1255,15 +1274,26 @@ class XMLItemImporter:
             # Create/update item price
             self.create_item_price(existing_item, item_data)
 
-            # Update stock levels - handle both string and numeric values
-            stock_qty = item_data.get('current_stock')
-            if stock_qty is not None and stock_qty != '':
-                try:
-                    stock_qty_float = flt(stock_qty)
-                    if stock_qty_float >= 0:
-                        self.update_stock_levels(existing_item, {'current_stock': stock_qty_float, 'purchase_price': item_data.get('purchase_price', 0)})
-                except (ValueError, TypeError):
-                    frappe.logger().warning(f"Invalid stock quantity '{stock_qty}' for item {item_code}")
+            # For set items, create/update Product Bundle
+            # is_set_item and has_existing_bundle were already determined before save
+            if is_set_item:
+                # Create/update Product Bundle
+                # This will mark the item as non-stock if needed
+                self.create_product_bundle(existing_item, item_data.get('set_items', []))
+                # Reload item to get updated is_stock_item value
+                existing_item.reload()
+
+            # Update stock levels - but SKIP for non-stock items (bundles)
+            # handle both string and numeric values
+            if not is_set_item and existing_item.is_stock_item:
+                stock_qty = item_data.get('current_stock')
+                if stock_qty is not None and stock_qty != '':
+                    try:
+                        stock_qty_float = flt(stock_qty)
+                        if stock_qty_float >= 0:
+                            self.update_stock_levels(existing_item, {'current_stock': stock_qty_float, 'purchase_price': item_data.get('purchase_price', 0)})
+                    except (ValueError, TypeError):
+                        frappe.logger().warning(f"Invalid stock quantity '{stock_qty}' for item {item_code}")
 
             frappe.db.commit()
             return True
@@ -1387,9 +1417,197 @@ class XMLItemImporter:
             except Exception as e:
                 frappe.log_error(f"Failed to create price list {price_list_name}: {str(e)}")
 
+    def create_product_bundle(self, item_doc: Document, set_items: List[Dict[str, Any]]) -> None:
+        """
+        Create or update a Product Bundle for set items.
+
+        Note: Product Bundles in ERPNext are for items that DON'T maintain stock.
+        When a bundle item is sold, it expands into component items.
+        If the set item has existing stock, we clear it first to allow
+        conversion to a non-stock Product Bundle.
+
+        Args:
+            item_doc: The parent Item document (the set)
+            set_items: List of component items with 'code' and 'amount' keys
+        """
+        try:
+            if not set_items:
+                return
+
+            item_code = item_doc.item_code
+
+            # Check if item has stock - if so, clear it first
+            # because ERPNext Product Bundles require is_stock_item = 0
+            stock_by_warehouse = frappe.db.sql("""
+                SELECT warehouse, actual_qty
+                FROM tabBin
+                WHERE item_code = %s AND actual_qty != 0
+            """, item_code, as_dict=True)
+
+            if stock_by_warehouse:
+                total_stock = sum(s.actual_qty for s in stock_by_warehouse)
+                frappe.logger().info(f"Set item {item_code} has stock ({total_stock}), clearing stock to convert to Product Bundle")
+
+                # Clear stock from each warehouse
+                for bin_data in stock_by_warehouse:
+                    self._clear_stock_for_bundle(item_code, bin_data.warehouse, bin_data.actual_qty)
+
+            # Also clear any Stock Entry records that reference this item
+            # This is needed to allow changing is_stock_item
+            self._clear_stock_entries_for_item(item_code)
+
+            # Check if Product Bundle already exists
+            existing_bundle = frappe.db.exists("Product Bundle", item_code)
+
+            if existing_bundle:
+                # Update existing bundle
+                bundle_doc = frappe.get_doc("Product Bundle", item_code)
+                # Clear existing items
+                bundle_doc.items = []
+            else:
+                # Create new bundle - truncate description to max 140 chars
+                bundle_description = (item_doc.item_name or item_code)[:140]
+                bundle_doc = frappe.get_doc({
+                    "doctype": "Product Bundle",
+                    "new_item_code": item_code,
+                    "description": bundle_description
+                })
+
+            # Add component items
+            items_added = 0
+            missing_items = []
+
+            for set_item in set_items:
+                component_code = set_item.get('code', '').strip()
+                qty = set_item.get('amount', 1)
+
+                if not component_code:
+                    continue
+
+                # Check if component item exists
+                if not frappe.db.exists("Item", component_code):
+                    missing_items.append(component_code)
+                    frappe.logger().warning(f"Product Bundle {item_code}: Component item {component_code} does not exist, skipping")
+                    continue
+
+                bundle_doc.append("items", {
+                    "item_code": component_code,
+                    "qty": qty,
+                    "description": frappe.db.get_value("Item", component_code, "item_name") or component_code
+                })
+                items_added += 1
+
+            # Only save if we have items
+            if items_added > 0:
+                # First, mark the item as non-stock (required for Product Bundle)
+                # BUT only if it's currently a stock item and no bundle exists yet
+                if item_doc.is_stock_item and not existing_bundle:
+                    item_doc.is_stock_item = 0
+                    item_doc.save(ignore_permissions=True)
+                    frappe.logger().info(f"Set {item_code} as non-stock item for Product Bundle")
+
+                if existing_bundle:
+                    bundle_doc.save(ignore_permissions=True)
+                    frappe.logger().info(f"Updated Product Bundle for {item_code} with {items_added} components")
+                else:
+                    bundle_doc.insert(ignore_permissions=True)
+                    frappe.logger().info(f"Created Product Bundle for {item_code} with {items_added} components")
+            else:
+                if missing_items:
+                    frappe.logger().warning(f"Could not create Product Bundle for {item_code}: all component items missing: {missing_items}")
+
+        except Exception as e:
+            frappe.log_error(f"Failed to create Product Bundle for {item_doc.item_code}: {str(e)}\\n{traceback.format_exc()}")
+
+    def _clear_stock_for_bundle(self, item_code: str, warehouse: str, qty: float) -> None:
+        """
+        Clear stock for an item in preparation for converting it to a Product Bundle.
+        Uses direct SQL deletion for reliability (avoids validation issues with Stock Entries).
+
+        Args:
+            item_code: The item code to clear stock for
+            warehouse: The warehouse to clear stock from
+            qty: The quantity to clear (not used - we delete all stock data)
+        """
+        try:
+            # Delete Stock Ledger Entries for this item and warehouse
+            frappe.db.sql("""
+                DELETE FROM `tabStock Ledger Entry`
+                WHERE item_code = %s AND warehouse = %s
+            """, (item_code, warehouse))
+
+            # Delete the Bin record
+            frappe.db.sql("""
+                DELETE FROM `tabBin`
+                WHERE item_code = %s AND warehouse = %s
+            """, (item_code, warehouse))
+
+            frappe.db.commit()
+            frappe.logger().info(f"Cleared stock data for {item_code} from {warehouse} for Product Bundle conversion")
+
+        except Exception as e:
+            frappe.log_error(f"Failed to clear stock for {item_code} in {warehouse}: {str(e)}\n{traceback.format_exc()}")
+            # Don't raise - try to continue with bundle creation
+
+    def _clear_stock_entries_for_item(self, item_code: str) -> None:
+        """
+        Clear Stock Entry records that reference this item.
+        This is needed to allow changing is_stock_item from 1 to 0.
+
+        Args:
+            item_code: The item code to clear stock entries for
+        """
+        try:
+            # Find Stock Entries that contain this item
+            stock_entries = frappe.db.sql("""
+                SELECT DISTINCT sed.parent
+                FROM `tabStock Entry Detail` sed
+                WHERE sed.item_code = %s
+            """, item_code, as_dict=True)
+
+            if not stock_entries:
+                return
+
+            frappe.logger().info(f"Clearing {len(stock_entries)} Stock Entries for item {item_code}")
+
+            for se in stock_entries:
+                # Delete Stock Entry Detail records
+                frappe.db.sql("""
+                    DELETE FROM `tabStock Entry Detail` WHERE parent = %s
+                """, se.parent)
+
+                # Delete the Stock Entry
+                frappe.db.sql("""
+                    DELETE FROM `tabStock Entry` WHERE name = %s
+                """, se.parent)
+
+            # Also clear all Stock Ledger Entries and Bins for this item
+            frappe.db.sql("DELETE FROM `tabStock Ledger Entry` WHERE item_code = %s", item_code)
+            frappe.db.sql("DELETE FROM `tabBin` WHERE item_code = %s", item_code)
+
+            # Clear GL Entries related to stock for this item
+            frappe.db.sql("""
+                DELETE FROM `tabGL Entry`
+                WHERE voucher_type = 'Stock Entry'
+                AND voucher_no IN (SELECT name FROM `tabStock Entry` WHERE name IN
+                    (SELECT DISTINCT parent FROM `tabStock Entry Detail` WHERE item_code = %s))
+            """, item_code)
+
+            frappe.db.commit()
+            frappe.logger().info(f"Cleared all stock entries for item {item_code}")
+
+        except Exception as e:
+            frappe.log_error(f"Failed to clear stock entries for {item_code}: {str(e)}\n{traceback.format_exc()}")
+            # Don't raise - try to continue
+
     def update_stock_levels(self, item_doc: Document, item_data: Dict[str, Any]) -> None:
         """Update stock levels using Stock Entry"""
         try:
+            # Skip stock updates for non-stock items (like Product Bundles)
+            if not item_doc.is_stock_item:
+                frappe.logger().debug(f"Skipping stock update for non-stock item {item_doc.item_code}")
+                return
+
             # Get default warehouse
             warehouse = frappe.db.get_single_value("Stock Settings", "default_warehouse")
             if not warehouse:
@@ -1791,12 +2009,15 @@ class SAXItemHandler(xml.sax.ContentHandler):
         self.in_pricelists = False
         self.in_pricelist = False
         self.in_parameters = False
+        self.in_set_items = False
+        self.in_set_item = False
         self.current_category = {}
         self.current_image = {}
         self.current_supplier = {}
         self.current_variant = {}
         self.current_pricelist = {}
         self.current_parameter = {}
+        self.current_set_item = {}
 
         # Counters
         self.items_queued = 0
@@ -1872,6 +2093,7 @@ class SAXItemHandler(xml.sax.ContentHandler):
                 "images": [],
                 "pricelists": [],
                 "variants": [],
+                "set_items": [],
                 "additional_data": {}
             }
 
@@ -1918,6 +2140,11 @@ class SAXItemHandler(xml.sax.ContentHandler):
                 self.in_parameters = True
             elif name == "PARAMETER" and self.in_parameters:
                 self.current_parameter = {"name": "", "value": ""}
+            elif name == "SET_ITEMS":
+                self.in_set_items = True
+            elif name == "SET_ITEM" and self.in_set_items:
+                self.in_set_item = True
+                self.current_set_item = {"code": "", "amount": 1}
 
     def characters(self, content: str):
         """Handle character data between XML tags"""
@@ -2008,6 +2235,14 @@ class SAXItemHandler(xml.sax.ContentHandler):
                 if self.current_parameter.get("name") or self.current_parameter.get("value"):
                     self.current_variant["parameters"].append(self.current_parameter.copy())
                 self.current_parameter = {}
+            elif name == "SET_ITEMS":
+                self.in_set_items = False
+            elif name == "SET_ITEM" and self.in_set_item:
+                # Complete set item - add to set_items list
+                if self.current_set_item.get("code"):
+                    self.current_item["set_items"].append(self.current_set_item.copy())
+                self.current_set_item = {}
+                self.in_set_item = False
             elif name == "PRICELISTS":
                 self.in_pricelists = False
             elif name == "PRICELIST" and self.in_pricelists:
@@ -2084,10 +2319,14 @@ class SAXItemHandler(xml.sax.ContentHandler):
                 else:
                     self.current_item["ean"] = data
             elif name == "CODE":
-                if self.in_variant:
+                if self.in_set_item:
+                    self.current_set_item["code"] = data
+                elif self.in_variant:
                     self.current_variant["code"] = data
                 elif len(self.element_stack) == 3:  # Only top-level CODE
                     self.current_item["item_code"] = data
+            elif name == "ITEM_TYPE":
+                self.current_item["item_type"] = data.lower() if data else ""
             elif name == "PRODUCTNO":
                 self.current_item["product_code"] = data
             elif name == "AVAILABILITY":
@@ -2095,8 +2334,14 @@ class SAXItemHandler(xml.sax.ContentHandler):
             elif name == "STOCK_QUANTITY":
                 self.current_item["stock_quantity"] = data
             elif name == "AMOUNT":
+                # Amount inside SET_ITEM
+                if self.in_set_item:
+                    try:
+                        self.current_set_item["amount"] = int(data) if data else 1
+                    except ValueError:
+                        self.current_set_item["amount"] = 1
                 # Stock amount inside STOCK tag
-                if self.in_variant:
+                elif self.in_variant:
                     self.current_variant["stock_amount"] = data
                 else:
                     self.current_item["stock_quantity"] = data
