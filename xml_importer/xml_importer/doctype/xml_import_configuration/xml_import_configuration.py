@@ -29,7 +29,7 @@ class XMLImportConfiguration(Document):
 					xml_source=self.xml_feed_url,
 					company=self.company,
 					use_queue=use_queue,
-					config=self.get_import_specific_fields()
+					config_name=self.name
 				)
 
 				# Update configuration with job info
@@ -51,7 +51,8 @@ class XMLImportConfiguration(Document):
 					timeout=3600,  # 1 hour timeout
 					job_name=f"XML Order Import - {self.name}",
 					xml_source=self.xml_feed_url,
-					company=self.company
+					company=self.company,
+					config_name=self.name
 				)
 
 				# Update configuration with job info

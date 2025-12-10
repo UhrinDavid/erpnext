@@ -22,16 +22,22 @@
   "last_content_size",
   "section_break_12",
   "notification_emails",
+  "item_tax_section",
+  "tax_account_mappings_item",
+  "order_tax_section",
+  "tax_account_mappings_order",
+  "order_import_options_section",
+  "create_customers",
+  "create_placeholder_items",
+  "column_break_order_options",
+  "auto_submit_orders",
+  "update_existing_orders",
   "section_break_14",
   "import_options_section",
   "create_item_groups",
   "create_manufacturers",
   "update_stock_levels",
-  "download_images",
-  "column_break_20",
-  "create_customers",
-  "create_placeholder_items",
-  "auto_submit_orders"
+  "download_images"
  ],
  "fields": [
   {
@@ -131,6 +137,71 @@
    "description": "Comma-separated email addresses to notify about import results"
   },
   {
+   "fieldname": "item_tax_section",
+   "fieldtype": "Section Break",
+   "label": "Item Tax Configuration",
+   "depends_on": "eval:doc.import_type=='Items'"
+  },
+  {
+   "fieldname": "tax_account_mappings_item",
+   "fieldtype": "Table",
+   "label": "Tax Rate to Account Mappings",
+   "options": "Tax Account Mapping Item",
+   "description": "Map VAT rates from XML to specific tax accounts for Item Tax Templates"
+  },
+  {
+   "fieldname": "order_tax_section",
+   "fieldtype": "Section Break",
+   "label": "Order Tax Configuration",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  },
+  {
+   "fieldname": "tax_account_mappings_order",
+   "fieldtype": "Table",
+   "label": "Tax Rate to Account Mappings",
+   "options": "Tax Account Mapping Order",
+   "description": "Map VAT rates from XML to specific tax accounts in ERPNext"
+  },
+  {
+   "fieldname": "order_import_options_section",
+   "fieldtype": "Section Break",
+   "label": "Order Import Options",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_customers",
+   "fieldtype": "Check",
+   "label": "Auto-create Customers",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  },
+  {
+   "default": "1",
+   "fieldname": "create_placeholder_items",
+   "fieldtype": "Check",
+   "label": "Create Placeholder Items",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  },
+  {
+   "fieldname": "column_break_order_options",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "auto_submit_orders",
+   "fieldtype": "Check",
+   "label": "Auto-submit Sales Orders",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  },
+  {
+   "default": "0",
+   "fieldname": "update_existing_orders",
+   "fieldtype": "Check",
+   "label": "Update Existing Orders",
+   "description": "Update orders that already exist instead of skipping them",
+   "depends_on": "eval:doc.import_type=='Orders'"
+  },
+  {
    "fieldname": "section_break_14",
    "fieldtype": "Section Break",
    "label": "Import Options"
@@ -168,31 +239,6 @@
    "fieldtype": "Check",
    "label": "Download Product Images",
    "depends_on": "eval:doc.import_type=='Items'"
-  },
-  {
-   "fieldname": "column_break_20",
-   "fieldtype": "Column Break"
-  },
-  {
-   "default": "1",
-   "fieldname": "create_customers",
-   "fieldtype": "Check",
-   "label": "Auto-create Customers",
-   "depends_on": "eval:doc.import_type=='Orders'"
-  },
-  {
-   "default": "1",
-   "fieldname": "create_placeholder_items",
-   "fieldtype": "Check",
-   "label": "Create Placeholder Items",
-   "depends_on": "eval:doc.import_type=='Orders'"
-  },
-  {
-   "default": "0",
-   "fieldname": "auto_submit_orders",
-   "fieldtype": "Check",
-   "label": "Auto-submit Sales Orders",
-   "depends_on": "eval:doc.import_type=='Orders'"
   }
  ],
  "index_web_pages_for_search": 1,

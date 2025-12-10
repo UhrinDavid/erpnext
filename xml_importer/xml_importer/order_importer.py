@@ -39,8 +39,208 @@ class XMLOrderImporter:
         self.error_count = 0
         self.errors = []
 
+        frappe.logger().info(f"XMLOrderImporter initialized with config: {self.config.name if self.config else 'None'}")
+        if self.config:
+            frappe.logger().info(f"Config has update_existing_orders: {getattr(self.config, 'update_existing_orders', 'NOT SET')}")
+            frappe.logger().info(f"Config has tax_account_mappings_order: {len(getattr(self.config, 'tax_account_mappings_order', []))} mappings")
+
         # Initialize required data
         self.ensure_required_data()
+
+        # Load tax account mappings from config
+        self._load_tax_account_mappings()
+
+    def _load_tax_account_mappings(self):
+        """Load tax rate to account mappings from configuration"""
+        self.tax_account_map = {}
+
+        if self.config and hasattr(self.config, 'tax_account_mappings_order'):
+            for mapping in self.config.tax_account_mappings_order:
+                # Frappe Percent fields store values as decimals (0.23 for 23%)
+                # but tax rates in XML are percentages (23.0 for 23%)
+                # We need to convert: if value < 1, multiply by 100
+                tax_rate = flt(mapping.tax_rate)
+                if tax_rate < 1 and tax_rate > 0:
+                    tax_rate = tax_rate * 100
+                self.tax_account_map[tax_rate] = mapping.tax_account
+
+        frappe.logger().info(f"Loaded {len(self.tax_account_map)} tax account mappings: {self.tax_account_map}")
+
+    def get_tax_account_for_rate(self, tax_rate: float) -> Optional[str]:
+        """
+        Get the tax account for a given tax rate
+
+        Args:
+            tax_rate: Tax rate percentage (e.g., 20.0 for 20%)
+
+        Returns:
+            Tax account name or None
+        """
+        tax_rate = flt(tax_rate)
+        return self.tax_account_map.get(tax_rate)
+
+    def _add_taxes_and_charges_to_order(self, sales_order, tax_rates_in_order: set, shipping_billing_items: list):
+        """
+        Add taxes and charges to Sales Order, including shipping/billing charges
+
+        Args:
+            sales_order: Sales Order document
+            tax_rates_in_order: Set of unique tax rates (as percentages) found in order items
+            shipping_billing_items: List of shipping/billing items to add as charges
+        """
+        frappe.logger().info(f"Adding taxes and charges - tax_rates: {tax_rates_in_order}, shipping/billing items: {len(shipping_billing_items)}")
+
+        # Clear existing taxes
+        sales_order.taxes = []
+
+        # Add shipping and billing charges (with their net amounts)
+        for item_data in shipping_billing_items:
+            item_type = item_data.get('item_type', '').lower()
+            # Use WITHOUT_VAT price (net amount)
+            net_amount = flt(item_data.get('unit_price_without_tax') or item_data.get('total_price_without_tax', 0))
+            vat_amount = flt(item_data.get('unit_tax') or item_data.get('total_tax', 0))
+            description = item_data.get('item_name', f"{item_type.capitalize()} Charge")
+
+            # Get appropriate expense account based on item type
+            if item_type == 'shipping':
+                account = self._get_shipping_account()
+            elif item_type == 'billing':
+                account = self._get_billing_account()
+            else:
+                account = self._get_default_charge_account()
+
+            if account and net_amount > 0:
+                # Add the net charge amount
+                charge_row = sales_order.append("taxes", {})
+                charge_row.charge_type = "Actual"
+                charge_row.account_head = account
+                charge_row.description = description
+                charge_row.tax_amount = net_amount
+                frappe.logger().info(f"Added {item_type} charge: {description} - {net_amount} (excl. VAT) to {account}")
+
+                # Add the VAT for this shipping/billing charge
+                if vat_amount > 0:
+                    tax_rate = flt(item_data.get('tax_rate') or item_data.get('item_tax_rate', 0))
+                    tax_account = self.get_tax_account_for_rate(tax_rate) if tax_rate > 0 else None
+
+                    if tax_account and frappe.db.exists("Account", tax_account):
+                        vat_row = sales_order.append("taxes", {})
+                        vat_row.charge_type = "Actual"
+                        vat_row.account_head = tax_account
+                        vat_row.description = f"VAT {tax_rate}% on {item_type.capitalize()}"
+                        vat_row.tax_amount = vat_amount
+                        frappe.logger().info(f"Added {item_type} VAT: {vat_amount} ({tax_rate}%) to {tax_account}")
+                    else:
+                        frappe.logger().warning(f"No tax account found for {item_type} VAT rate {tax_rate}%")
+            elif not account:
+                frappe.logger().warning(f"No account found for {item_type} charge")
+
+        # Add VAT taxes for product items (On Net Total)
+        if tax_rates_in_order and self.tax_account_map:
+            for tax_rate in sorted(tax_rates_in_order):
+                tax_account = self.get_tax_account_for_rate(tax_rate)
+                frappe.logger().info(f"Looking for account for tax rate {tax_rate}% -> {tax_account}")
+
+                if tax_account:
+                    # Verify the account exists and get its details
+                    if not frappe.db.exists("Account", tax_account):
+                        frappe.logger().warning(f"Tax account {tax_account} not found for rate {tax_rate}%")
+                        continue
+
+                    # Add tax row for product items
+                    tax_row = sales_order.append("taxes", {})
+                    tax_row.charge_type = "On Net Total"
+                    tax_row.account_head = tax_account
+                    tax_row.description = f"VAT {tax_rate}% on Products"
+                    tax_row.rate = tax_rate
+                    frappe.logger().info(f"Added product VAT: {tax_rate}% -> {tax_account}")
+                else:
+                    frappe.logger().warning(f"No tax account mapping found for rate {tax_rate}%")
+        elif not self.tax_account_map:
+            frappe.logger().warning(f"Cannot add taxes - no tax account mappings configured")
+
+    def _get_shipping_account(self):
+        """
+        Get the expense account for shipping charges
+        Returns the first matching account from common shipping account names
+        """
+        shipping_accounts = [
+            "Freight and Forwarding Charges - H",
+            "Shipping Charges - H",
+            "Delivery Charges - H",
+            "Freight and Forwarding Charges",
+            "Shipping Charges",
+            "Delivery Charges"
+        ]
+
+        for account in shipping_accounts:
+            if frappe.db.exists("Account", account):
+                return account
+
+        # Fallback: try to find any Freight account
+        freight_accounts = frappe.db.get_all(
+            "Account",
+            filters={
+                "company": self.company,
+                "account_name": ["like", "%Freight%"]
+            },
+            limit=1
+        )
+        if freight_accounts:
+            return freight_accounts[0].name
+
+        frappe.logger().warning("No shipping expense account found, using default")
+        return self._get_default_charge_account()
+
+    def _get_billing_account(self):
+        """
+        Get the expense account for billing charges
+        Returns the first matching account from common billing/misc expense account names
+        """
+        billing_accounts = [
+            "Miscellaneous Expenses - H",
+            "Other Charges - H",
+            "Billing Charges - H",
+            "Miscellaneous Expenses",
+            "Other Charges",
+            "Billing Charges"
+        ]
+
+        for account in billing_accounts:
+            if frappe.db.exists("Account", account):
+                return account
+
+        frappe.logger().warning("No billing expense account found, using default")
+        return self._get_default_charge_account()
+
+    def _get_default_charge_account(self):
+        """
+        Get a default expense account for charges when specific account not found
+        """
+        # Try to find a general expense account
+        default_accounts = [
+            "Miscellaneous Expenses - H",
+            "Miscellaneous Expenses",
+            "Expenses - H",
+            "Expenses"
+        ]
+
+        for account in default_accounts:
+            if frappe.db.exists("Account", account):
+                return account
+
+        # Last resort: get any expense account for this company
+        expense_account = frappe.db.get_value(
+            "Account",
+            {
+                "company": self.company,
+                "root_type": "Expense",
+                "is_group": 0
+            },
+            "name"
+        )
+
+        return expense_account
 
     def ensure_required_data(self):
         """Ensure required master data exists"""
@@ -476,9 +676,16 @@ class XMLOrderImporter:
             existing_order = frappe.db.get_value("Sales Order", {"po_no": external_order_id}, "name")
 
             if existing_order:
-                # Skip if order already exists
-                frappe.logger().info(f"Order {external_order_id} already exists as {existing_order}, skipping")
-                return ('skipped', 'exists')
+                # Check if we should update existing orders
+                update_existing = self.config and getattr(self.config, 'update_existing_orders', 0)
+                frappe.logger().info(f"Order {external_order_id} exists as {existing_order}. Update flag: {update_existing}")
+                if update_existing:
+                    frappe.logger().info(f"Updating existing order {existing_order}...")
+                    return self._update_existing_order(existing_order, order_data)
+                else:
+                    # Skip if order already exists and update is disabled
+                    frappe.logger().info(f"Order {external_order_id} already exists as {existing_order}, skipping (update disabled)")
+                    return ('skipped', 'exists')
 
             # Create customer
             customer_name = self.create_or_update_customer(order_data)
@@ -507,22 +714,42 @@ class XMLOrderImporter:
             product_items_added = 0
             all_item_types = []
             failed_items = []
+            tax_rates_in_order = set()  # Track unique tax rates found in items
+            shipping_billing_items = []  # Track shipping/billing charges
+
             # Valid product types: 'product', 'set' (product bundles), or empty for backwards compatibility
             valid_product_types = ['product', 'set', '']
             for item_data in order_data.get('order_items', []):
                 item_type = item_data.get('item_type', '').lower()
                 all_item_types.append(f"{item_type}:{item_data.get('item_code', 'no_code')}")
-                # Only add product/set items to sales order (skip shipping, billing, discount)
-                if item_type in valid_product_types or item_type is None:
+
+                # Separate handling for shipping/billing vs product items
+                if item_type in ['shipping', 'billing']:
+                    # Collect shipping/billing items for Taxes and Charges
+                    shipping_billing_items.append(item_data)
+                    frappe.logger().info(f"Found {item_type} item: {item_data.get('item_name', 'unknown')} - ${item_data.get('unit_price', 0)}")
+                elif item_type in valid_product_types or item_type is None:
+                    # Add product/set items to sales order line items
                     if self.add_order_item(sales_order, item_data):
                         product_items_added += 1
+                        # Track tax rate from this item - try both fields
+                        tax_rate = flt(item_data.get('tax_rate') or item_data.get('item_tax_rate', 0))
+                        frappe.logger().info(f"Item {item_data.get('item_code')} has tax_rate={item_data.get('tax_rate')}, item_tax_rate={item_data.get('item_tax_rate')}, final={tax_rate}")
+                        if tax_rate > 0:
+                            tax_rates_in_order.add(tax_rate)
                     else:
                         failed_items.append(item_data.get('item_code', item_data.get('item_name', 'unknown')))
+
+            frappe.logger().info(f"Collected tax rates from order items: {tax_rates_in_order}")
+            frappe.logger().info(f"Found {len(shipping_billing_items)} shipping/billing charges")
 
             # Only create order if we have product items
             if product_items_added == 0:
                 frappe.logger().warning(f"No valid product items for order {external_order_id}: items={all_item_types}, failed={failed_items}")
                 return ('skipped', 'no_products')
+
+            # Add taxes and charges (including shipping/billing)
+            self._add_taxes_and_charges_to_order(sales_order, tax_rates_in_order, shipping_billing_items)
 
             # Set totals
             sales_order.run_method("calculate_taxes_and_totals")
@@ -549,6 +776,80 @@ class XMLOrderImporter:
         except Exception as e:
             frappe.db.rollback()
             error_msg = f"Failed to process order {order_data.get('external_order_id', 'Unknown')}: {str(e)}"
+            self.add_error(error_msg)
+            frappe.log_error(error_msg)
+            return ('error', str(e))
+
+    def _update_existing_order(self, order_name: str, order_data: Dict[str, Any]) -> tuple:
+        """Update an existing Sales Order with new data from XML
+
+        Args:
+            order_name: Name of existing Sales Order
+            order_data: Order data from XML
+
+        Returns:
+            tuple: (status, order_name) where status is 'updated' or 'error'
+        """
+        try:
+            # Get the existing order
+            sales_order = frappe.get_doc("Sales Order", order_name)
+
+            # Only update if order is in Draft status
+            if sales_order.docstatus != 0:
+                frappe.logger().warning(f"Cannot update {order_name} - already submitted or cancelled")
+                return ('skipped', 'not_draft')
+
+            # Clear existing items and taxes
+            sales_order.items = []
+            sales_order.taxes = []
+
+            # Process order items
+            product_items_added = 0
+            tax_rates_in_order = set()
+            shipping_billing_items = []  # Track shipping/billing charges
+            valid_product_types = ['product', 'set', '']
+
+            for item_data in order_data.get('order_items', []):
+                item_type = item_data.get('item_type', '').lower()
+
+                # Separate handling for shipping/billing vs product items
+                if item_type in ['shipping', 'billing']:
+                    # Collect shipping/billing items for Taxes and Charges
+                    shipping_billing_items.append(item_data)
+                    frappe.logger().info(f"Found {item_type} item for update: {item_data.get('item_name', 'unknown')}")
+                elif item_type in valid_product_types or item_type is None:
+                    if self.add_order_item(sales_order, item_data):
+                        product_items_added += 1
+                        # Track tax rate from this item
+                        tax_rate = flt(item_data.get('tax_rate') or item_data.get('item_tax_rate', 0))
+                        if tax_rate > 0:
+                            tax_rates_in_order.add(tax_rate)
+
+            if product_items_added == 0:
+                frappe.logger().warning(f"No valid product items for order update {order_name}")
+                return ('error', 'no_products')
+
+            # Add taxes and charges (including shipping/billing)
+            self._add_taxes_and_charges_to_order(sales_order, tax_rates_in_order, shipping_billing_items)
+
+            # Update customer remarks if present
+            if order_data.get('customer_remark'):
+                sales_order.remarks = order_data.get('customer_remark')
+
+            # Recalculate totals
+            sales_order.run_method("calculate_taxes_and_totals")
+
+            # Save updated order
+            sales_order.save(ignore_permissions=True)
+
+            self.updated_count += 1
+            frappe.logger().info(f"Updated Sales Order: {sales_order.name}")
+
+            return ('updated', sales_order.name)
+
+        except Exception as e:
+            frappe.db.rollback()
+            error_msg = f"Failed to update order {order_name}: {str(e)}"
             self.add_error(error_msg)
             frappe.log_error(error_msg)
             return ('error', str(e))
@@ -1112,19 +1413,20 @@ def get_redis_client():
 
 
 @frappe.whitelist()
-def import_xml_orders_sax(xml_source: str, company: str = None) -> Dict[str, Any]:
+def import_xml_orders_sax(xml_source: str, company: str = None, config_name: str = None) -> Dict[str, Any]:
     """
     Import orders from XML feed using SAX parser with Redis queue
 
     Args:
         xml_source: URL or file path to XML feed
         company: Company name (optional)
+        config_name: Name of XML Import Configuration document (optional)
 
     Returns:
         Dict with import results
     """
     try:
-        result = _import_xml_orders_sax_internal(xml_source, company)
+        result = _import_xml_orders_sax_internal(xml_source, company, config_name)
 
         # Always create import log and update config status
         _create_order_import_log_from_result(xml_source, result)
@@ -1149,13 +1451,14 @@ def import_xml_orders_sax(xml_source: str, company: str = None) -> Dict[str, Any
         raise
 
 
-def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dict[str, Any]:
+def _import_xml_orders_sax_internal(xml_source: str, company: str = None, config_name: str = None) -> Dict[str, Any]:
     """
     Import orders from XML feed using SAX parser with Redis queue
 
     Args:
         xml_source: URL or file path to XML feed
         company: Company name (optional)
+        config_name: Name of XML Import Configuration document (optional)
 
     Returns:
         Dict with import results
@@ -1163,8 +1466,14 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None) -> Dic
     try:
         frappe.logger().info(f"Starting SAX-based XML order import from: {xml_source}")
 
+        # Load config if provided
+        config = None
+        if config_name:
+            config = frappe.get_doc("XML Import Configuration", config_name)
+            frappe.logger().info(f"Loaded config: {config_name}")
+
         # Create importer to use existing functionality
-        importer = XMLOrderImporter(xml_source, company)
+        importer = XMLOrderImporter(xml_source, company, config)
 
         # Fetch XML content
         xml_content = importer.fetch_xml_content()

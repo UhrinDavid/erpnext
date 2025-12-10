@@ -58,6 +58,9 @@ class XMLItemImporter:
         self.ensure_additional_categories_field()
         self.ensure_short_description_field()
 
+        # Load tax account mappings from config (for items)
+        self._load_tax_account_mappings()
+
     def ensure_required_uoms(self):
         """Ensure commonly used UOMs exist"""
         required_uoms = [
@@ -420,7 +423,10 @@ class XMLItemImporter:
         """Set item tax information using Item Tax Template"""
         try:
             tax_rate = flt(item_data.get('tax_rate', 0))
+            frappe.logger().info(f"Item {item_doc.item_code}: tax_rate from item_data = {tax_rate}, raw value = {item_data.get('tax_rate')}")
+
             if tax_rate <= 0:
+                frappe.logger().warning(f"Skipping tax setup for item {item_doc.item_code} - tax rate is {tax_rate}")
                 return
 
             # Get or create the appropriate Item Tax Template
@@ -454,7 +460,7 @@ class XMLItemImporter:
 
         This method will:
         1. Look for existing template with this exact rate
-        2. If not found, create a new one with the default VAT account
+        2. If not found, create a new one with the mapped tax account (if available) or default VAT account
         3. Return the template name
 
         Args:
@@ -467,41 +473,72 @@ class XMLItemImporter:
             # Get company abbreviation for naming
             company_abbr = frappe.get_cached_value("Company", self.company, "abbr")
 
-            # Standard template naming: "VAT {rate}% - {abbr}"
-            template_title = f"VAT {tax_rate}%"
-            template_name = f"{template_title} - {company_abbr}"
+            # Get tax account - prefer mapped account, fallback to generic VAT account
+            tax_account = None
+            if hasattr(self, 'tax_account_map') and tax_rate in self.tax_account_map:
+                tax_account = self.tax_account_map[tax_rate]
+                frappe.logger().info(f"Using mapped tax account '{tax_account}' for {tax_rate}%")
+            else:
+                tax_account = self.get_vat_account()
+                frappe.logger().info(f"Using default VAT account '{tax_account}' for {tax_rate}%")
 
-            # Check if template already exists
-            if frappe.db.exists("Item Tax Template", template_name):
-                frappe.logger().debug(f"Using existing Item Tax Template: {template_name}")
-                return template_name
-
-            # Get or identify the VAT account
-            vat_account = self.get_vat_account()
-            if not vat_account:
-                frappe.logger().error(f"No VAT account found for company {self.company}")
+            if not tax_account:
+                frappe.logger().error(f"No tax account found for company {self.company} and rate {tax_rate}%")
                 return None
 
-            # Create new Item Tax Template
-            frappe.logger().info(f"Creating new Item Tax Template: {template_name}")
+            # Get account name for better template naming
+            account_name = frappe.db.get_value("Account", tax_account, "account_name") or "VAT"
 
-            tax_template = frappe.get_doc({
-                "doctype": "Item Tax Template",
-                "title": template_title,
-                "company": self.company,
-                "taxes": [
-                    {
-                        "tax_type": vat_account,
-                        "tax_rate": tax_rate
-                    }
-                ]
-            })
+            # Create template name based on account name (e.g., "SK DPH 23% - H")
+            # This ensures templates are unique per tax account
+            template_title = f"{account_name}"
+            template_name = f"{template_title} - {company_abbr}"
 
-            tax_template.insert(ignore_permissions=True)
-            frappe.db.commit()
+            # Check if template already exists with this exact tax account
+            existing_template = None
+            if frappe.db.exists("Item Tax Template", template_name):
+                # Verify it has the correct tax account
+                existing_doc = frappe.get_doc("Item Tax Template", template_name)
+                if existing_doc.taxes and existing_doc.taxes[0].tax_type == tax_account:
+                    frappe.logger().debug(f"Using existing Item Tax Template: {template_name}")
+                    return template_name
+                else:
+                    # Template exists but has wrong account - we'll update it
+                    existing_template = existing_doc
+                    frappe.logger().info(f"Updating existing template {template_name} with correct tax account")
 
-            frappe.logger().info(f"Created Item Tax Template: {template_name} with rate {tax_rate}%")
-            return template_name
+            if existing_template:
+                # Update existing template with correct account
+                existing_template.taxes = []
+                existing_template.append("taxes", {
+                    "tax_type": tax_account,
+                    "tax_rate": tax_rate
+                })
+                existing_template.save(ignore_permissions=True)
+                frappe.db.commit()
+                frappe.logger().info(f"Updated Item Tax Template: {template_name} with account {tax_account} and rate {tax_rate}%")
+                return template_name
+            else:
+                # Create new Item Tax Template
+                frappe.logger().info(f"Creating new Item Tax Template: {template_name}")
+
+                tax_template = frappe.get_doc({
+                    "doctype": "Item Tax Template",
+                    "title": template_title,
+                    "company": self.company,
+                    "taxes": [
+                        {
+                            "tax_type": tax_account,
+                            "tax_rate": tax_rate
+                        }
+                    ]
+                })
+
+                tax_template.insert(ignore_permissions=True)
+                frappe.db.commit()
+
+                frappe.logger().info(f"Created Item Tax Template: {template_name} with account {tax_account} and rate {tax_rate}%")
+                return template_name
 
         except Exception as e:
             frappe.log_error(
@@ -747,6 +784,90 @@ class XMLItemImporter:
                 f"Failed to create 'short_description' custom field: {str(e)}",
                 "Custom Field Creation Error"
             )
+
+    def _load_tax_account_mappings(self):
+        """Load tax rate to account mappings from configuration for item import"""
+        self.tax_account_map = {}
+
+        if self.config and hasattr(self.config, 'tax_account_mappings_item'):
+            for mapping in self.config.tax_account_mappings_item:
+                # Frappe Percent fields store values as decimals (0.23 for 23%)
+                # but tax rates in XML are percentages (23.0 for 23%)
+                # We need to convert: if value < 1, multiply by 100
+                tax_rate = flt(mapping.tax_rate)
+                if tax_rate < 1 and tax_rate > 0:
+                    tax_rate = tax_rate * 100
+                self.tax_account_map[tax_rate] = mapping.tax_account
+
+        frappe.logger().info(f"Loaded {len(self.tax_account_map)} tax account mappings for items: {self.tax_account_map}")
+
+    def remove_item_stock(self, item_code: str) -> bool:
+        """
+        Remove all stock for an item before changing is_stock_item from 1 to 0
+
+        Args:
+            item_code: Item code to remove stock for
+
+        Returns:
+            bool: True if stock was successfully removed or no stock exists, False if failed
+        """
+        try:
+            # Check current stock across all warehouses
+            stock_data = frappe.db.sql("""
+                SELECT warehouse, actual_qty, stock_value, stock_value_difference
+                FROM `tabBin`
+                WHERE item_code = %s AND actual_qty != 0
+            """, item_code, as_dict=True)
+
+            if not stock_data:
+                frappe.logger().info(f"No stock found for {item_code}, safe to change to non-stock")
+                return True
+
+            frappe.logger().info(f"Found stock for {item_code} in {len(stock_data)} warehouses, removing...")
+
+            # Get the item's current valuation rate from item master
+            item_valuation_rate = frappe.db.get_value("Item", item_code, "valuation_rate") or 0
+
+            # Create a stock reconciliation to zero out all stock
+            stock_reco = frappe.new_doc("Stock Reconciliation")
+            stock_reco.company = self.company
+            stock_reco.purpose = "Stock Reconciliation"
+            stock_reco.set_posting_time = 1
+            stock_reco.posting_date = frappe.utils.today()
+            stock_reco.posting_time = frappe.utils.nowtime()
+
+            for stock in stock_data:
+                # Calculate valuation rate from existing stock
+                current_valuation_rate = item_valuation_rate
+                if stock.actual_qty and stock.stock_value:
+                    current_valuation_rate = flt(stock.stock_value) / flt(stock.actual_qty)
+
+                # If still no valuation rate, log warning and skip this item
+                if not current_valuation_rate:
+                    frappe.logger().warning(
+                        f"Cannot remove stock for {item_code} in {stock.warehouse}: "
+                        f"No valuation rate found. Set Item.valuation_rate to enable stock removal."
+                    )
+                    return False
+
+                stock_reco.append("items", {
+                    "item_code": item_code,
+                    "warehouse": stock.warehouse,
+                    "qty": 0,  # Set to zero
+                    "valuation_rate": current_valuation_rate  # Use existing rate
+                })
+
+            stock_reco.insert(ignore_permissions=True)
+            stock_reco.submit()
+            frappe.db.commit()
+
+            frappe.logger().info(f"Successfully removed stock for {item_code} via Stock Reconciliation {stock_reco.name}")
+            return True
+
+        except Exception as e:
+            frappe.logger().error(f"Failed to remove stock for {item_code}: {str(e)}")
+            frappe.log_error(f"Stock removal failed for {item_code}: {str(e)}", "Item Stock Removal Error")
+            return False
 
     def create_item_category_links(self, item_code: str, categories: List[Dict], default_category: str = None) -> None:
         """Create item-category links in a custom way"""
@@ -1135,13 +1256,30 @@ class XMLItemImporter:
             is_set_item = item_data.get('item_type') == 'set' and item_data.get('set_items')
             has_existing_bundle = frappe.db.exists("Product Bundle", item_code)
 
-            # Handle is_stock_item setting
+            # Handle is_stock_item setting with automatic stock removal if needed
             if has_existing_bundle:
                 # If there's an existing bundle, ALWAYS keep is_stock_item = 0
-                existing_item.is_stock_item = 0
+                # If currently is_stock_item = 1, we need to change it to 0
+                if is_update and existing_item.is_stock_item == 1:
+                    # Remove stock before changing to non-stock item
+                    if self.remove_item_stock(item_code):
+                        existing_item.is_stock_item = 0
+                        frappe.logger().info(f"Changed {item_code} from stock to non-stock (has bundle)")
+                    else:
+                        frappe.logger().warning(f"Could not remove stock for {item_code}, keeping as stock item")
+                else:
+                    existing_item.is_stock_item = 0
             elif is_set_item:
                 # New set item - mark as non-stock (will create bundle later)
-                existing_item.is_stock_item = 0
+                # If updating and currently stock item, remove stock first
+                if is_update and existing_item.is_stock_item == 1:
+                    if self.remove_item_stock(item_code):
+                        existing_item.is_stock_item = 0
+                        frappe.logger().info(f"Changed {item_code} from stock to non-stock (is set)")
+                    else:
+                        frappe.logger().warning(f"Could not remove stock for {item_code}, keeping as stock item")
+                else:
+                    existing_item.is_stock_item = 0
             elif not is_update:
                 # New regular item - mark as stock item
                 existing_item.is_stock_item = 1
@@ -1627,6 +1765,16 @@ class XMLItemImporter:
             difference = target_qty - current_stock
 
             if abs(difference) > 0.001:  # Only update if significant difference
+                purchase_price = flt(item_data.get('purchase_price', 0))
+
+                # Skip stock update if purchase price is 0 - will cause valuation errors
+                if purchase_price == 0:
+                    frappe.logger().warning(
+                        f"Skipping stock update for {item_doc.item_code}: purchase_price is 0. "
+                        f"Set a valuation rate in Item master to enable stock updates."
+                    )
+                    return
+
                 stock_entry = frappe.get_doc({
                     "doctype": "Stock Entry",
                     "stock_entry_type": "Material Receipt" if difference > 0 else "Material Issue",
@@ -1636,7 +1784,8 @@ class XMLItemImporter:
                         "qty": abs(difference),
                         "t_warehouse": warehouse if difference > 0 else None,
                         "s_warehouse": warehouse if difference < 0 else None,
-                        "basic_rate": item_data.get('purchase_price', 0)
+                        "basic_rate": purchase_price,
+                        "allow_zero_valuation_rate": 0  # Require valuation rate
                     }]
                 })
                 stock_entry.insert(ignore_permissions=True)
@@ -2660,7 +2809,7 @@ def cancel_import() -> Dict[str, Any]:
 
 @frappe.whitelist()
 def import_xml_items_sax(xml_source: str, company: str = None,
-                        use_queue: bool = True, config: Dict[str, Any] = None) -> Dict[str, Any]:
+                        use_queue: bool = True, config: Dict[str, Any] = None, config_name: str = None) -> Dict[str, Any]:
     """
     Import items from XML feed using SAX parser with Redis queue
 
@@ -2671,13 +2820,14 @@ def import_xml_items_sax(xml_source: str, company: str = None,
         xml_source: URL or file path to XML feed
         company: Company name (optional)
         use_queue: Kept for backward compatibility (always True)
-        config: Import configuration options (download_images, create_item_groups, etc.)
+        config: Import configuration options (download_images, create_item_groups, etc.) - DEPRECATED
+        config_name: Name of XML Import Configuration document (optional)
 
     Returns:
         Dict with import results
     """
     try:
-        result = _import_xml_items_sax_internal(xml_source, company, use_queue, config)
+        result = _import_xml_items_sax_internal(xml_source, company, use_queue, config, config_name)
 
         # Create import log when running as background job
         if frappe.local.job:
@@ -2705,7 +2855,7 @@ def import_xml_items_sax(xml_source: str, company: str = None,
 
 
 def _import_xml_items_sax_internal(xml_source: str, company: str = None,
-                                  use_queue: bool = True, config: Dict[str, Any] = None) -> Dict[str, Any]:
+                                  use_queue: bool = True, config: Dict[str, Any] = None, config_name: str = None) -> Dict[str, Any]:
     """
     Import items from XML feed using SAX parser with Redis queue
 
@@ -2716,18 +2866,26 @@ def _import_xml_items_sax_internal(xml_source: str, company: str = None,
         xml_source: URL or file path to XML feed
         company: Company name (optional)
         use_queue: Kept for backward compatibility (always True)
-        config: Import configuration options (download_images, create_item_groups, etc.)
+        config: Import configuration options (download_images, create_item_groups, etc.) - DEPRECATED
+        config_name: Name of XML Import Configuration document (optional)
 
     Returns:
         Dict with import results
     """
     try:
         frappe.logger().info(f"Starting SAX-based XML import from: {xml_source}")
-        if config:
-            frappe.logger().info(f"Import config: {config}")
 
-        # Create importer to use existing functionality
-        importer = XMLItemImporter(xml_source, company, config)
+        # Load config document if config_name is provided
+        config_doc = None
+        if config_name:
+            config_doc = frappe.get_doc("XML Import Configuration", config_name)
+            frappe.logger().info(f"Loaded config: {config_name} with {len(getattr(config_doc, 'tax_account_mappings_item', []))} tax mappings")
+
+        if config:
+            frappe.logger().info(f"Import config dict (deprecated): {config}")
+
+        # Create importer to use existing functionality (pass config_doc not config dict)
+        importer = XMLItemImporter(xml_source, company, config_doc)
 
         # Fetch XML content
         xml_content = importer.fetch_xml_content()
