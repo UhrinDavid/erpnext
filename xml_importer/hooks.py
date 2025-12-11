@@ -95,7 +95,7 @@ required_apps = ["erpnext"]
 # ------------
 
 # before_install = "xml_importer.install.before_install"
-# after_install = "xml_importer.install.after_install"
+after_install = "xml_importer.install.after_install.after_install"
 
 # Uninstallation
 # ------------
