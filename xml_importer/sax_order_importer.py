@@ -272,7 +272,7 @@ class SAXXMLOrderImporter(OriginalXMLOrderImporter):
                 "order_number": sax_order_data.get("order_number", ""),
                 "order_date": sax_order_data.get("order_date", ""),
                 "customer_data": sax_order_data.get("customer_data", {}),
-                "items": sax_order_data.get("items", []),
+                "order_items": sax_order_data.get("items", []),  # Map 'items' to 'order_items'
                 "additional_data": sax_order_data.get("additional_data", {})
             }
 

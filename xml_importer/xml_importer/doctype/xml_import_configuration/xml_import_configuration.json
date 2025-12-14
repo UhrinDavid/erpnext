@@ -10,6 +10,7 @@
   "import_type",
   "xml_feed_url",
   "company",
+    "order_country_code",
 
   "section_break_4",
   "import_frequency",
@@ -67,6 +68,15 @@
    "options": "Company",
    "reqd": 1
   },
+    {
+     "default": "SK",
+     "fieldname": "order_country_code",
+     "fieldtype": "Data",
+     "label": "Order Country Code",
+     "description": "ISO country code prefix to use on Sales Order Customer's Purchase Order (po_no), e.g. SK",
+     "depends_on": "eval:doc.import_type=='Orders'",
+     "length": 8
+    },
 
   {
    "fieldname": "section_break_4",

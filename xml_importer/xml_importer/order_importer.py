@@ -618,7 +618,18 @@ class XMLOrderImporter:
             and reason is the skip/error reason
         """
         try:
-            external_order_id = order_data.get('external_order_id')
+            # Build external order identifier from config country code + XML CODE
+            country_code = None
+            if self.config:
+                # support both attribute and dict-like access
+                country_code = getattr(self.config, 'order_country_code', None) or (
+                    self.config.get('order_country_code') if hasattr(self.config, 'get') else None
+                )
+            country_code = (country_code or 'SK').strip()
+
+            order_code = (order_data.get('order_code') or '').strip()
+            # Do not fallback to ORDER_ID; CODE must be present
+            external_order_id = f"{country_code}-{order_code}" if order_code else None
             if not external_order_id:
                 self.add_error("Missing external order ID")
                 return ('error', 'missing_id')
@@ -629,7 +640,7 @@ class XMLOrderImporter:
                 frappe.logger().info(f"Skipping cancelled order {external_order_id} with status: {order_data.get('order_status')}")
                 return ('skipped', 'cancelled')
 
-            # Check if order exists
+            # Check if order exists by correct po_no
             existing_order = frappe.db.get_value("Sales Order", {"po_no": external_order_id}, "name")
 
             if existing_order:
@@ -643,6 +654,9 @@ class XMLOrderImporter:
                     # Skip if order already exists and update is disabled
                     frappe.logger().info(f"Order {external_order_id} already exists as {existing_order}, skipping (update disabled)")
                     return ('skipped', 'exists')
+
+            # Fallback: if update is enabled, try find an existing draft order for same customer/date
+            # No date-based fallback matching; only update by exact po_no
 
             # Create customer
             customer_name = self.create_or_update_customer(order_data)
@@ -663,22 +677,35 @@ class XMLOrderImporter:
             sales_order.po_no = external_order_id
             sales_order.po_date = order_date.date()
 
-            # Add customer remarks
-            if order_data.get('customer_remark'):
-                sales_order.remarks = order_data.get('customer_remark')
-
             # Process order items
             product_items_added = 0
             all_item_types = []
             failed_items = []
             tax_rates_in_order = set()  # Track unique tax rates found in items
 
-            # Add ALL items as line items (products, shipping, billing, discount)
-            for item_data in order_data.get('order_items', []):
+            # Debug: Check if order_items is empty
+            order_items = order_data.get('order_items', [])
+            frappe.logger().info(f"Order {external_order_id} has {len(order_items)} items in order_data")
+
+            # Process items: add products/shipping/billing as line items, store discount as coupon
+            coupon_code = None
+            for item_data in order_items:
                 item_type = item_data.get('item_type', '').lower()
                 all_item_types.append(f"{item_type}:{item_data.get('item_code', 'no_code')}")
 
-                # Add all items (product, set, shipping, billing, discount) as line items
+                # Handle discount items as coupon codes
+                if item_type == 'discount':
+                    # Use discount item name directly (e.g., "Zľavový kupón číslo CPEAJ3 - Zľava 10%")
+                    item_name = item_data.get('item_name', '')
+                    if item_name:
+                        coupon_code = item_name
+                    else:
+                        coupon_code = item_data.get('item_code', '')  # Fallback to code
+
+                    frappe.logger().info(f"Found discount coupon: {coupon_code}")
+                    continue  # Don't add as line item
+
+                # Add all other items (product, set, shipping, billing) as line items
                 if self.add_order_item(sales_order, item_data):
                     product_items_added += 1
                     # Track tax rate from this item
@@ -688,6 +715,13 @@ class XMLOrderImporter:
                     frappe.logger().info(f"Added {item_type} item: {item_data.get('item_name', 'unknown')} - tax rate {tax_rate}%")
                 else:
                     failed_items.append(item_data.get('item_code', item_data.get('item_name', 'unknown')))
+
+            # Create Pricing Rule and Coupon Code for discount if found
+            if coupon_code:
+                coupon_code_name = self.get_or_create_coupon_code(coupon_code)
+                if coupon_code_name:
+                    sales_order.coupon_code = coupon_code_name
+                    frappe.logger().info(f"Set coupon code: {coupon_code_name}")
 
             frappe.logger().info(f"Collected tax rates from order items: {tax_rates_in_order}")
 
@@ -754,11 +788,24 @@ class XMLOrderImporter:
             # Process order items
             product_items_added = 0
             tax_rates_in_order = set()
+            coupon_code = None
 
             for item_data in order_data.get('order_items', []):
                 item_type = item_data.get('item_type', '').lower()
 
-                # Add all items (product, set, shipping, billing, discount) as line items
+                # Handle discount items as coupon codes
+                if item_type == 'discount':
+                    # Use discount item name directly
+                    item_name = item_data.get('item_name', '')
+                    if item_name:
+                        coupon_code = item_name
+                    else:
+                        coupon_code = item_data.get('item_code', '')
+
+                    frappe.logger().info(f"Found discount coupon in update: {coupon_code}")
+                    continue
+
+                # Add all other items (product, set, shipping, billing) as line items
                 if self.add_order_item(sales_order, item_data):
                     product_items_added += 1
                     # Track tax rate from this item
@@ -766,14 +813,30 @@ class XMLOrderImporter:
                     if tax_rate > 0:
                         tax_rates_in_order.add(tax_rate)
 
+            # Create Pricing Rule and Coupon Code for discount if found
+            if coupon_code:
+                coupon_code_name = self.get_or_create_coupon_code(coupon_code)
+                if coupon_code_name:
+                    sales_order.coupon_code = coupon_code_name
+                    frappe.logger().info(f"Set coupon code on update: {coupon_code_name}")
+
+            # Ensure po_no uses country code + CODE on updates too
+            country_code = None
+            if self.config:
+                country_code = getattr(self.config, 'order_country_code', None) or (
+                    self.config.get('order_country_code') if hasattr(self.config, 'get') else None
+                )
+            country_code = (country_code or 'SK').strip()
+            order_code = (order_data.get('order_code') or '').strip()
+            if order_code:
+                sales_order.po_no = f"{country_code}-{order_code}"
+
             if product_items_added == 0:
                 frappe.logger().warning(f"No valid items for order update {order_name}")
                 return ('error', 'no_products')
 
             # Add taxes based on tax rates found in items
-            self._add_taxes_to_order(sales_order, tax_rates_in_order)            # Update customer remarks if present
-            if order_data.get('customer_remark'):
-                sales_order.remarks = order_data.get('customer_remark')
+            self._add_taxes_to_order(sales_order, tax_rates_in_order)
 
             # Recalculate totals
             sales_order.run_method("calculate_taxes_and_totals")
@@ -797,6 +860,7 @@ class XMLOrderImporter:
         """Add item to sales order"""
         try:
             item_code = item_data.get('item_code')
+            frappe.logger().info(f"add_order_item called with item_code={item_code}, item_name={item_data.get('item_name')}")
             if not item_code:
                 frappe.logger().warning(f"No item code found for item: {item_data.get('item_name')}")
                 return False
@@ -855,18 +919,22 @@ class XMLOrderImporter:
                     item_row.warehouse = default_warehouse
 
             # Add item tax template for service items (shipping/billing) based on VAT rate
-            if is_service_item and item_data.get('vat_rate'):
-                tax_rate = self.parse_decimal(str(item_data.get('vat_rate')))
-                if tax_rate > 0:
-                    tax_template = self.get_or_create_item_tax_template(tax_rate)
-                    if tax_template:
-                        item_row.item_tax_template = tax_template
-                        frappe.logger().info(f"Applied tax template '{tax_template}' to {item_type} item {item_code} in order")
+            if is_service_item:
+                # Try multiple fields: vat_rate (SAX), tax_rate (DOM), item_tax_rate (DOM)
+                vat_rate_value = item_data.get('vat_rate') or item_data.get('tax_rate') or item_data.get('item_tax_rate')
+                if vat_rate_value:
+                    tax_rate = self.parse_decimal(str(vat_rate_value))
+                    if tax_rate > 0:
+                        tax_template = self.get_or_create_item_tax_template(tax_rate)
+                        if tax_template:
+                            item_row.item_tax_template = tax_template
+                            frappe.logger().info(f"Applied tax template '{tax_template}' ({tax_rate}%) to {item_type} item {item_code} in order")
 
             frappe.logger().info(f"Added {item_type} item {item_code} qty={item_row.qty} rate={item_row.rate} to sales order")
             return True
 
         except Exception as e:
+            frappe.logger().error(f"EXCEPTION in add_order_item for {item_data.get('item_code')}: {str(e)}")
             frappe.log_error(f"Failed to add order item {item_data.get('item_code')}: {str(e)}")
             return False
 
@@ -990,6 +1058,53 @@ class XMLOrderImporter:
 
         except Exception as e:
             frappe.log_error(f"Failed to create tax template for rate {tax_rate}%: {str(e)}")
+            return None
+
+    def get_or_create_coupon_code(self, coupon_name: str) -> str:
+        """
+        Get or create Coupon Code under the Imported Order Coupons pricing rule
+
+        Args:
+            coupon_name: Full name of the coupon (e.g., "Zľavový kupón číslo CPEAJ3 - Zľava 10%")
+
+        Returns:
+            str: Name of the Coupon Code document
+        """
+        try:
+            pricing_rule_title = "Imported Order Coupons"
+
+            # Get pricing rule name by title
+            pricing_rule_name = frappe.db.get_value('Pricing Rule', {'title': pricing_rule_title}, 'name')
+            if not pricing_rule_name:
+                frappe.logger().error(f"Pricing Rule with title '{pricing_rule_title}' not found. Run migration first.")
+                return None
+
+            # Use coupon name as unique identifier
+            coupon_doc_name = coupon_name[:140]  # ERPNext name limit
+
+            # Check if coupon code already exists
+            if frappe.db.exists('Coupon Code', coupon_doc_name):
+                frappe.logger().debug(f"Using existing coupon code: {coupon_doc_name}")
+                return coupon_doc_name
+
+            # Create new coupon code
+            coupon = frappe.get_doc({
+                'doctype': 'Coupon Code',
+                'coupon_name': coupon_name,
+                'coupon_code': coupon_name,
+                'pricing_rule': pricing_rule_name,
+                'valid_from': frappe.utils.nowdate(),
+                'maximum_use': 999999,  # Unlimited uses since it's already applied
+                'used': 0
+            })
+
+            coupon.insert(ignore_permissions=True)
+            frappe.db.commit()
+            frappe.logger().info(f"Created coupon code: {coupon_doc_name}")
+            return coupon_doc_name
+
+        except Exception as e:
+            frappe.log_error(f"Failed to create coupon code for '{coupon_name}': {str(e)}")
             return None
 
     def add_error(self, error_msg: str) -> None:
@@ -1323,7 +1438,7 @@ class SAXOrderHandler(xml.sax.ContentHandler):
                 self.in_total_price = False
 
         # Parse order-level fields
-        elif self.in_order and not self.in_customer and not self.in_order_items and not self.in_total_price:
+        elif self.in_order and not self.in_customer and not self.in_order_items and not self.in_total_price and not self.in_currency:
             if name_upper == "ORDER_ID":
                 self.current_order["external_order_id"] = data
             elif name_upper == "CODE":
@@ -1373,6 +1488,8 @@ class SAXOrderHandler(xml.sax.ContentHandler):
                     self.current_item["total_price_with_vat"] = data
                 elif name_upper == "WITHOUT_VAT":
                     self.current_item["total_price_without_vat"] = data
+                elif name_upper == "VAT_RATE":
+                    self.current_item["vat_rate"] = data
             else:
                 item_field_map = {
                     "TYPE": "item_type",
@@ -1588,6 +1705,8 @@ def _import_xml_orders_sax_internal(xml_source: str, company: str = None, config
                     frappe.log_error(f"Redis reconnection failed: {str(re)}")
                     continue
             except Exception as e:
+            # Backfill function removed per requirements
+
                 error_count += 1
                 error_msg = f"Redis error getting order: {str(e)}"
                 errors.append(error_msg)
